@@ -1,4 +1,4 @@
-# DO NOT EXECUTE THIS SCRIPT LOCALLY
+# DO NOT EXECUTE THIS SCRIPT LOCALLY FOR ANY REASON WHATSOEVER
 
 import os
 import random
@@ -24,12 +24,16 @@ PROTEIN_RESIDUES = {
 
 # Directories and Dataset Paths
 DEFAULT_SAVE_DIR = "./pdb_data"
-TRAIN_PDB_IDS = ["1ubq", "1a8o", "1bpi", "1cjg", "1eyy"]
+TRAIN_PDB_IDS = [
+    "1ubq", "1a8o", "1bpi", "1cjg", "1eyy", "1hel", "1l2y", "1pga",
+    "1shg", "1csp", "1a70", "1f9g", "2igd", "1ten", "1ycr", "3gbw",
+    "1uzx", "2h3l", "1a62", "1mbo"
+]
 TEST_PDB_ID = "1crn"
 
 # Volumetric & Rasterization Grid Configuration
 DEFAULT_BOX_SIZE = 16.0
-GRID_SIZE = 64
+GRID_SIZE = 32
 
 # Gaussian Rasterization Sigmas
 DEFAULT_SIGMA = 0.8
@@ -55,11 +59,12 @@ SCHEDULER_T_MAX = 60
 SCHEDULER_ETA_MIN = 1e-5
 NUM_EPOCHS = 60
 BATCH_SIZE = 8
+EARLY_STOPPING_PATIENCE = 5
 
-# Dataset Pre-caching Configuration
-NUM_TRAIN_CROPS = 640
-NUM_VAL_CROPS = 120
-NUM_TEST_CROPS = 20
+# Dataset Configuration
+NUM_TRAIN_CROPS = 2000  # Number of virtual crops sampled on-the-fly per epoch
+NUM_VAL_CROPS = 400     # Number of pre-cached validation crops
+NUM_TEST_CROPS = 50     # Number of pre-cached unseen test crops
 
 # 3D Peak Finding & Post-Processing (Mean-Shift)
 DEFAULT_PEAK_THRESHOLD = 0.30
@@ -546,22 +551,15 @@ if __name__ == "__main__":
         train_structures.append((all_coords.to(device), carbon_coords.to(device)))
         print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_coords)} | Carbons: {len(carbon_coords)}")
 
-    # Pre-cache training and validation datasets
-    print(f"\nPre-caching {NUM_TRAIN_CROPS} training crops from PDB structures...")
-    train_dataset = []
-    for idx in range(NUM_TRAIN_CROPS):
-        train_input, train_target = crop_and_rasterize_dynamic(train_structures)
-        train_dataset.append((train_input, train_target))
-        if (idx + 1) % 50 == 0:
-            torch.cuda.empty_cache()
-
-    print(f"Pre-caching {NUM_VAL_CROPS} validation crops...")
+    # Pre-cache validation dataset (training set is sampled on-the-fly for infinite variations)
+    print(f"\nPre-caching {NUM_VAL_CROPS} validation crops...")
     val_dataset = []
     for idx in range(NUM_VAL_CROPS):
         val_input, val_target = crop_and_rasterize_dynamic(train_structures)
         val_dataset.append((val_input, val_target))
         if (idx + 1) % 50 == 0:
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Initialize U-Net, optimizer, and scheduler
     model = UNet3D()
@@ -579,16 +577,18 @@ if __name__ == "__main__":
     print(" RUNNING REAL PDB U-NET GENERALIZATION TRAINING ")
     print("="*75)
 
+    steps_per_epoch = NUM_TRAIN_CROPS // BATCH_SIZE
+
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
         train_loss = 0.0
 
-        # Shuffle indices of the pre-cached training dataset
-        shuffled_indices = torch.randperm(len(train_dataset))
-
-        for i in range(0, len(train_dataset), BATCH_SIZE):
-            batch_indices = shuffled_indices[i : i + BATCH_SIZE]
-            batch_samples = [train_dataset[idx] for idx in batch_indices]
+        for step in range(steps_per_epoch):
+            # Sample crops on-the-fly from the 20 structures to get infinite diverse training inputs
+            batch_samples = [crop_and_rasterize_dynamic(train_structures) for _ in range(BATCH_SIZE)]
 
             inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)
             targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device)
@@ -602,9 +602,9 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
 
-            train_loss += loss.item() * len(batch_samples)
+            train_loss += loss.item() * BATCH_SIZE
 
-        train_loss /= len(train_dataset)
+        train_loss /= (steps_per_epoch * BATCH_SIZE)
 
         # Validation evaluation on the stable, pre-cached set
         model.eval()
@@ -622,6 +622,16 @@ if __name__ == "__main__":
 
         current_lr = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS} | LR: {current_lr:.6f} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+
+        # Check for early stopping based on validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
+                print(f"\nEarly stopping triggered: validation loss did not improve for {EARLY_STOPPING_PATIENCE} consecutive epochs.")
+                break
 
     # Evaluation on a completely unseen real protein (Crambin 1CRN)
     print("\n" + "="*75)

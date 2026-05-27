@@ -1,0 +1,26 @@
+{
+  "languages": {
+    "Python": {
+      "language_servers": [
+        "basedpyright",
+        "pyright"
+      ]
+    }
+  },
+  "lsp": {
+    "pyright": {
+      "settings": {
+        "python": {
+          "pythonPath": "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3"
+        }
+      }
+    },
+    "basedpyright": {
+      "settings": {
+        "python": {
+          "pythonPath": "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3"
+        }
+      }
+    }
+  }
+}

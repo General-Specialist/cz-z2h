@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# OS generated files
+.DS_Store
+
+# Exclude lec2.py as requested
+lec2.py
+
+# Environment/system folders
+.antigravitycli/

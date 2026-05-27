@@ -10,6 +10,9 @@ import gemmi
 # CONSTANTS & CONFIGURATIONS
 # ==============================================================================
 
+# Seed for reproducibility
+RANDOM_SEED = 42
+
 # Standard amino acid residues to filter out water, ions, and ligands
 PROTEIN_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
@@ -23,8 +26,7 @@ TEST_PDB_ID = "1crn"
 
 # Volumetric & Rasterization Grid Configuration
 DEFAULT_BOX_SIZE = 16.0
-DEFAULT_GRID_SIZE = 32
-TRAIN_GRID_SIZE = 64
+GRID_SIZE = 64
 
 # Gaussian Rasterization Sigmas
 DEFAULT_SIGMA = 0.8
@@ -42,6 +44,8 @@ TRAIN_NOISE_LEVEL = 0.04
 DEFAULT_RADIUS = 0.8
 
 # Training & Optimization Hyperparameters
+UNET_IN_CHANNELS = 1
+UNET_OUT_CHANNELS = 1
 UNET_INIT_FEATURES = 32
 LEARNING_RATE = 0.001
 SCHEDULER_T_MAX = 60
@@ -64,19 +68,43 @@ CLASH_LIMIT = 0.6
 # Coordinate Metric Evaluation
 MATCHING_RADIUS = 1.0
 
+# Data Augmentation Constants
+AUGMENT_FLIP_PROB = 0.5
+
+# Loss Configuration
+BCE_DICE_EPS = 1e-6
+
+# Network Architectural Constants
+CHANNEL_ATTN_REDUCTION = 4
+SPATIAL_ATTN_KERNEL_SIZE = 3
+SPATIAL_ATTN_PADDING = 1
+CONV_KERNEL_SIZE = 3
+CONV_PADDING = 1
+POOL_KERNEL_SIZE = 2
+POOL_STRIDE = 2
+TRANSPOSE_KERNEL_SIZE = 2
+TRANSPOSE_STRIDE = 2
+OUT_CONV_KERNEL_SIZE = 1
+
+# Peak Finder Numerical Stability & Filter Constants
+MAXPOOL_PEAK_KERNEL_SIZE = 3
+MAXPOOL_PEAK_STRIDE = 1
+MAXPOOL_PEAK_PADDING = 1
+PEAK_FINDER_EPSILON = 1e-8
+
 
 # ==============================================================================
 # SECTION 1: UTILITIES, PIPELINES & DATA AUGMENTATION
 # ==============================================================================
 
-def download_pdb_cif(pdb_id, save_dir=DEFAULT_SAVE_DIR):
-    os.makedirs(save_dir, exist_ok=True)
-    path = f"{save_dir}/{pdb_id}.cif"
+def download_pdb_cif(pdb_id: str) -> str:
+    os.makedirs(DEFAULT_SAVE_DIR, exist_ok=True)
+    path = f"{DEFAULT_SAVE_DIR}/{pdb_id}.cif"
     urllib.request.urlretrieve(f"https://files.rcsb.org/download/{pdb_id}.cif", path)
     return path
 
 
-def load_and_crop_pdb(filepath: str, box_size: float = DEFAULT_BOX_SIZE) -> tuple[torch.Tensor, torch.Tensor]:
+def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
     structure = gemmi.read_structure(filepath)
 
     all_atoms = []
@@ -106,7 +134,7 @@ def load_and_crop_pdb(filepath: str, box_size: float = DEFAULT_BOX_SIZE) -> tupl
     center_atom = all_coords[random_idx]
 
     # Keep coordinates falling inside the local box bounds around center_atom
-    half_box = box_size / 2.0
+    half_box = DEFAULT_BOX_SIZE / 2.0
 
     all_mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
     cropped_all = all_coords[all_mask]
@@ -114,25 +142,25 @@ def load_and_crop_pdb(filepath: str, box_size: float = DEFAULT_BOX_SIZE) -> tupl
     carbon_mask = torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)
     cropped_carbon = carbon_coords[carbon_mask]
 
-    # Shift coordinates so that center_atom is centered exactly at [box_size/2, box_size/2, box_size/2]
-    # This maps the cropped region exactly into the [0, box_size]^3 voxel space.
+    # Shift coordinates so that center_atom is centered exactly at [DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2]
+    # This maps the cropped region exactly into the [0, DEFAULT_BOX_SIZE]^3 voxel space.
     cropped_all_centered = cropped_all - center_atom + half_box
     cropped_carbon_centered = cropped_carbon - center_atom + half_box
 
     return cropped_all_centered, cropped_carbon_centered
 
 
-def coords_to_density(coords: torch.Tensor, box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, sigma: float = DEFAULT_SIGMA) -> torch.Tensor:
+def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
     """
     Vectorized, differentiable, and chunked 3D density rasterization.
     Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
     """
     if coords.shape[0] == 0:
-        return torch.zeros((grid_size, grid_size, grid_size), device=coords.device)
+        return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=coords.device)
 
     device = coords.device
     # Generate the 3D grid ticks
-    ticks = torch.linspace(0.0, box_size, grid_size, device=device)
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
     g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
@@ -152,20 +180,20 @@ def coords_to_density(coords: torch.Tensor, box_size: float = DEFAULT_BOX_SIZE, 
         atom_densities_chunk = torch.exp(-sq_dists_chunk / (2 * (sigma ** 2)))
         density_flat += atom_densities_chunk.sum(dim=-1)
 
-    return density_flat.view(grid_size, grid_size, grid_size)
+    return density_flat.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
 
-def coords_to_binary_grid(coords: torch.Tensor, box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, radius: float = DEFAULT_RADIUS) -> torch.Tensor:
+def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
     """
     Vectorized, differentiable, and chunked 3D binary grid rasterizer.
     Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
     """
     if coords.shape[0] == 0:
-        return torch.zeros((grid_size, grid_size, grid_size), device=coords.device)
+        return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=coords.device)
 
     device = coords.device
     # Generate the 3D grid ticks
-    ticks = torch.linspace(0.0, box_size, grid_size, device=device)
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
     g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
@@ -186,8 +214,8 @@ def coords_to_binary_grid(coords: torch.Tensor, box_size: float = DEFAULT_BOX_SI
         chunk_min, _ = torch.min(dists_chunk, dim=-1)
         min_dists_flat = torch.min(min_dists_flat, chunk_min)
 
-    binary_grid_flat = (min_dists_flat <= radius).float()
-    return binary_grid_flat.view(grid_size, grid_size, grid_size)
+    binary_grid_flat = (min_dists_flat <= DEFAULT_RADIUS).float()
+    return binary_grid_flat.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
 
 def augment_batch_3d(inputs: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -205,7 +233,7 @@ def augment_batch_3d(inputs: torch.Tensor, targets: torch.Tensor) -> tuple[torch
 
         # 1. Random Flips (Reflections) - boundary-preserving
         for dim in (-3, -2, -1):
-            if random.random() > 0.5:
+            if random.random() > AUGMENT_FLIP_PROB:
                 x = torch.flip(x, dims=[dim])
                 y = torch.flip(y, dims=[dim])
 
@@ -223,9 +251,8 @@ def augment_batch_3d(inputs: torch.Tensor, targets: torch.Tensor) -> tuple[torch
 
 
 class BCEDiceLoss(nn.Module):
-    def __init__(self, eps: float = 1e-6) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.eps = eps
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         bce = F.binary_cross_entropy(pred, target, reduction='mean')
@@ -237,26 +264,26 @@ class BCEDiceLoss(nn.Module):
         intersection = torch.sum(pred_flat * target_flat, dim=-1)
         union = torch.sum(pred_flat, dim=-1) + torch.sum(target_flat, dim=-1)
 
-        dice = 1.0 - (2.0 * intersection + self.eps) / (union + self.eps)
+        dice = 1.0 - (2.0 * intersection + BCE_DICE_EPS) / (union + BCE_DICE_EPS)
         return bce + dice.mean()
 
 
-def generate_cryo_em_sample(filepaths: list[str], box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, noise_level: float = DEFAULT_NOISE_LEVEL) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def generate_cryo_em_sample(filepaths: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Crops a local spatial sub-volume from a random protein and rasterizes:
     - Input: all atoms, wider blur (lower resolution), with added Gaussian noise.
     - Target: carbon atoms only, sharp blur, clean.
     """
     filepath = random.choice(filepaths)
-    all_coords, carbon_coords = load_and_crop_pdb(filepath, box_size=box_size)
+    all_coords, carbon_coords = load_and_crop_pdb(filepath)
 
     # Input map: all atoms, wider blur (simulating low-resolution cryo-EM map)
-    input_density = coords_to_density(all_coords, box_size=box_size, grid_size=grid_size, sigma=INPUT_SIGMA)
-    noise = torch.randn_like(input_density) * noise_level
+    input_density = coords_to_density(all_coords, sigma=INPUT_SIGMA)
+    noise = torch.randn_like(input_density) * DEFAULT_NOISE_LEVEL
     input_density = F.relu(input_density + noise) # clamp negative densities to 0
 
     # Target map: carbons only, sharp blur (simulating ground-truth carbon positions)
-    target_density = coords_to_density(carbon_coords, box_size=box_size, grid_size=grid_size, sigma=TARGET_SIGMA)
+    target_density = coords_to_density(carbon_coords, sigma=TARGET_SIGMA)
 
     return input_density, target_density, carbon_coords
 
@@ -269,14 +296,14 @@ class ChannelAttention3D(nn.Module):
     """
     3D Squeeze-and-Excitation Channel Attention module.
     """
-    def __init__(self, channels: int, reduction: int = 4) -> None:
+    def __init__(self, channels: int) -> None:
         super().__init__()
         self.fc = nn.Sequential(
             nn.AdaptiveAvgPool3d(1),
             nn.Flatten(),
-            nn.Linear(channels, channels // reduction),
+            nn.Linear(channels, channels // CHANNEL_ATTN_REDUCTION),
             nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels),
+            nn.Linear(channels // CHANNEL_ATTN_REDUCTION, channels),
             nn.Sigmoid()
         )
 
@@ -292,7 +319,7 @@ class SpatialAttention3D(nn.Module):
     """
     def __init__(self) -> None:
         super().__init__()
-        self.conv = nn.Conv3d(2, 1, kernel_size=3, padding=1)
+        self.conv = nn.Conv3d(2, 1, kernel_size=SPATIAL_ATTN_KERNEL_SIZE, padding=SPATIAL_ATTN_PADDING)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         max_out, _ = torch.max(x, dim=1, keepdim=True)
@@ -310,10 +337,10 @@ class DoubleConv3D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv3d(in_channels, out_channels, kernel_size=CONV_KERNEL_SIZE, padding=CONV_PADDING),
             nn.BatchNorm3d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv3d(out_channels, out_channels, kernel_size=CONV_KERNEL_SIZE, padding=CONV_PADDING),
             nn.BatchNorm3d(out_channels),
             nn.ReLU(inplace=True)
         )
@@ -326,53 +353,53 @@ class UNet3D(nn.Module):
     """
     Fully batched and parameterized 3D U-Net Segmenter with Channel & Spatial Attention.
     """
-    def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 8) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        F_dim = init_features
+        F_dim = UNET_INIT_FEATURES
 
         # --- Encoder (Downsampling Path) ---
-        self.down1 = DoubleConv3D(in_channels, F_dim)
-        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)  # Halves resolution: 32^3 -> 16^3
+        self.down1 = DoubleConv3D(UNET_IN_CHANNELS, F_dim)
+        self.pool1 = nn.MaxPool3d(kernel_size=POOL_KERNEL_SIZE, stride=POOL_STRIDE)
 
         self.down2 = DoubleConv3D(F_dim, F_dim * 2)
-        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)  # Halves resolution: 16^3 -> 8^3
+        self.pool2 = nn.MaxPool3d(kernel_size=POOL_KERNEL_SIZE, stride=POOL_STRIDE)
 
         # --- Bottleneck ---
         self.bottleneck = DoubleConv3D(F_dim * 2, F_dim * 4)
         self.bottleneck_att = ChannelAttention3D(F_dim * 4)
 
         # --- Decoder (Upsampling Path) ---
-        self.up1 = nn.ConvTranspose3d(F_dim * 4, F_dim * 2, kernel_size=2, stride=2)  # Upsamples: 8^3 -> 16^3
+        self.up1 = nn.ConvTranspose3d(F_dim * 4, F_dim * 2, kernel_size=TRANSPOSE_KERNEL_SIZE, stride=TRANSPOSE_STRIDE)
         self.conv_up1 = DoubleConv3D(F_dim * 4, F_dim * 2)
         self.att1 = SpatialAttention3D()
 
-        self.up2 = nn.ConvTranspose3d(F_dim * 2, F_dim, kernel_size=2, stride=2)  # Upsamples: 16^3 -> 32^3
+        self.up2 = nn.ConvTranspose3d(F_dim * 2, F_dim, kernel_size=TRANSPOSE_KERNEL_SIZE, stride=TRANSPOSE_STRIDE)
         self.conv_up2 = DoubleConv3D(F_dim * 2, F_dim)
         self.att2 = SpatialAttention3D()
 
-        self.out_conv = nn.Conv3d(F_dim, out_channels, kernel_size=1)
+        self.out_conv = nn.Conv3d(F_dim, UNET_OUT_CHANNELS, kernel_size=OUT_CONV_KERNEL_SIZE)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # --- Encoder ---
-        x1 = self.down1(x)              # Shape: [B, F_dim, 32, 32, 32]
-        p1 = self.pool1(x1)             # Shape: [B, F_dim, 16, 16, 16]
+        x1 = self.down1(x)
+        p1 = self.pool1(x1)
 
-        x2 = self.down2(p1)             # Shape: [B, 2*F_dim, 16, 16, 16]
-        p2 = self.pool2(x2)             # Shape: [B, 2*F_dim, 8, 8, 8]
+        x2 = self.down2(p1)
+        p2 = self.pool2(x2)
 
         # --- Bottleneck ---
-        b = self.bottleneck(p2)         # Shape: [B, 4*F_dim, 8, 8, 8]
+        b = self.bottleneck(p2)
         b = self.bottleneck_att(b)
 
         # --- Decoder ---
-        u1 = self.up1(b)                # Shape: [B, 2*F_dim, 16, 16, 16]
+        u1 = self.up1(b)
         c1 = torch.cat([u1, x2], dim=1) # Skip connection
-        x3 = self.conv_up1(c1)          # Shape: [B, 2*F_dim, 16, 16, 16]
+        x3 = self.conv_up1(c1)
         x3 = self.att1(x3)
 
-        u2 = self.up2(x3)               # Shape: [B, F_dim, 32, 32, 32]
+        u2 = self.up2(x3)
         c2 = torch.cat([u2, x1], dim=1) # Skip connection
-        x4 = self.conv_up2(c2)          # Shape: [B, F_dim, 32, 32, 32]
+        x4 = self.conv_up2(c2)
         x4 = self.att2(x4)
 
         out = self.out_conv(x4)
@@ -388,39 +415,39 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
     Continuous 3D Mean-Shift Clustering Peak Finder natively in PyTorch on GPU.
     Seek mode centers in real continuous space with sub-voxel precision.
     """
-    def __init__(self, threshold: float = DEFAULT_PEAK_THRESHOLD, bandwidth: float = DEFAULT_PEAK_BANDWIDTH, max_peaks: int = DEFAULT_MAX_PEAKS, box_size: float = DEFAULT_BOX_SIZE, iterations: int = DEFAULT_PEAK_ITERATIONS) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.threshold = threshold
-        self.bandwidth = bandwidth
-        self.max_peaks = max_peaks
-        self.box_size = box_size
-        self.iterations = iterations
 
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, X, Y, Z = density.shape
         device = density.device
 
-        M = self.max_peaks
+        M = DEFAULT_MAX_PEAKS
         out_coords = torch.zeros((B, M, 3), dtype=torch.float32, device=device)
         out_values = torch.zeros((B, M), dtype=torch.float32, device=device)
         out_mask = torch.zeros((B, M), dtype=torch.bool, device=device)
 
-        ticks = torch.linspace(0.0, self.box_size, X, device=device)
+        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X, device=device)
         grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
         grid_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [X, Y, Z, 3]
         flat_grid = grid_coords.view(-1, 3) # Shape: [X*Y*Z, 3]
-        spacing = self.box_size / (X - 1)
+        spacing = DEFAULT_BOX_SIZE / (X - 1)
 
         # 3D MaxPool filter to select high-quality starting seeds
-        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
-        is_peak_mask = (density == max_pooled) & (density > self.threshold)
+        max_pooled = F.max_pool3d(
+            density,
+            kernel_size=MAXPOOL_PEAK_KERNEL_SIZE,
+            stride=MAXPOOL_PEAK_STRIDE,
+            padding=MAXPOOL_PEAK_PADDING
+        )
+        is_peak_mask = (density == max_pooled) & (density > DEFAULT_PEAK_THRESHOLD)
 
         for b in range(B):
             sample_density = density[b, 0] # [X, Y, Z]
             sample_peaks = is_peak_mask[b, 0] # [X, Y, Z]
 
             # 1. Extract active coordinates and weights for distance computations
-            active_mask = sample_density > self.threshold
+            active_mask = sample_density > DEFAULT_PEAK_THRESHOLD
             active_coords = flat_grid[active_mask.view(-1)] # [A, 3]
             active_weights = sample_density[active_mask] # [A]
 
@@ -431,16 +458,16 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
             seeds = seeds[sorted_idx[:M]]
 
             # 3. Iterative Mean-Shift seeks in continuous space
-            for _ in range(self.iterations):
+            for _ in range(DEFAULT_PEAK_ITERATIONS):
                 s2 = torch.sum(seeds ** 2, dim=-1, keepdim=True) # [S, 1]
                 a2 = torch.sum(active_coords ** 2, dim=-1, keepdim=True).t() # [1, A]
                 sq_dists = s2 + a2 - 2.0 * torch.matmul(seeds, active_coords.t()) # [S, A]
                 sq_dists = torch.clamp(sq_dists, min=0.0)
 
-                weights = torch.exp(-sq_dists / (2.0 * (self.bandwidth ** 2))) # [S, A]
+                weights = torch.exp(-sq_dists / (2.0 * (DEFAULT_PEAK_BANDWIDTH ** 2))) # [S, A]
                 total_weights = weights * active_weights.unsqueeze(0) # [S, A]
 
-                denominator = torch.sum(total_weights, dim=-1, keepdim=True) + 1e-8
+                denominator = torch.sum(total_weights, dim=-1, keepdim=True) + PEAK_FINDER_EPSILON
                 new_seeds = torch.matmul(total_weights, active_coords) / denominator
                 seeds = new_seeds
 
@@ -478,9 +505,42 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
 # ==============================================================================
 # SECTION 4: GENERALIZED REAL-DATA TRAINING & COORDINATE DECODING
 # ==============================================================================
+
+# Dynamic cropping function using global constants
+def crop_and_rasterize_dynamic(structures: list, return_coords: bool = False) -> tuple:
+    # Pick a random structure
+    all_coords, carbon_coords = random.choice(structures)
+
+    num_atoms = all_coords.shape[0]
+    random_idx = torch.randint(0, num_atoms, (1,)).item()
+    center_atom = all_coords[random_idx]
+
+    half_box = DEFAULT_BOX_SIZE / 2.0
+    carbon_mask = torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)
+    cropped_carbon = carbon_coords[carbon_mask]
+
+    all_mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
+    cropped_all = all_coords[all_mask]
+
+    # Shift coordinates to align inside the [0, DEFAULT_BOX_SIZE]^3 space
+    cropped_all_centered = cropped_all - center_atom + half_box
+    cropped_carbon_centered = cropped_carbon - center_atom + half_box
+
+    # Rasterize inputs and targets on the fly
+    input_density = coords_to_density(cropped_all_centered, sigma=INPUT_SIGMA)
+    noise = torch.randn_like(input_density) * TRAIN_NOISE_LEVEL
+    input_density = F.relu(input_density + noise)
+
+    target_density = coords_to_binary_grid(cropped_carbon_centered)
+
+    if return_coords:
+        return input_density, target_density, cropped_carbon_centered
+    return input_density, target_density
+
+
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    random.seed(42)
+    torch.manual_seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
 
     # Select execution device (Apple Silicon MPS, NVIDIA CUDA, or CPU) early
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
@@ -517,42 +577,11 @@ if __name__ == "__main__":
         train_structures.append((all_coords, carbon_coords))
         print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_atoms)} | Carbons: {len(carbon_atoms)}")
 
-    # Dynamic cropping function
-    def crop_and_rasterize_dynamic(structures: list, box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, noise_level: float = TRAIN_NOISE_LEVEL, return_coords: bool = False) -> tuple:
-        # Pick a random structure
-        all_coords, carbon_coords = random.choice(structures)
-
-        num_atoms = all_coords.shape[0]
-        random_idx = torch.randint(0, num_atoms, (1,)).item()
-        center_atom = all_coords[random_idx]
-
-        half_box = box_size / 2.0
-        carbon_mask = torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)
-        cropped_carbon = carbon_coords[carbon_mask]
-
-        all_mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
-        cropped_all = all_coords[all_mask]
-
-        # Shift coordinates to align inside the [0, box_size]^3 space
-        cropped_all_centered = cropped_all - center_atom + half_box
-        cropped_carbon_centered = cropped_carbon - center_atom + half_box
-
-        # Rasterize inputs and targets on the fly
-        input_density = coords_to_density(cropped_all_centered, box_size=box_size, grid_size=grid_size, sigma=INPUT_SIGMA)
-        noise = torch.randn_like(input_density) * noise_level
-        input_density = F.relu(input_density + noise)
-
-        target_density = coords_to_binary_grid(cropped_carbon_centered, box_size=box_size, grid_size=grid_size, radius=DEFAULT_RADIUS)
-
-        if return_coords:
-            return input_density, target_density, cropped_carbon_centered
-        return input_density, target_density
-
     # Pre-cache training and validation datasets
     print(f"\nPre-caching {NUM_TRAIN_CROPS} training crops from PDB structures...")
     train_dataset = []
     for idx in range(NUM_TRAIN_CROPS):
-        train_input, train_target = crop_and_rasterize_dynamic(train_structures, box_size=DEFAULT_BOX_SIZE, grid_size=TRAIN_GRID_SIZE, noise_level=TRAIN_NOISE_LEVEL)
+        train_input, train_target = crop_and_rasterize_dynamic(train_structures)
         train_dataset.append((train_input, train_target))
         if (idx + 1) % 50 == 0:
             torch.cuda.empty_cache()
@@ -560,13 +589,13 @@ if __name__ == "__main__":
     print(f"Pre-caching {NUM_VAL_CROPS} validation crops...")
     val_dataset = []
     for idx in range(NUM_VAL_CROPS):
-        val_input, val_target = crop_and_rasterize_dynamic(train_structures, box_size=DEFAULT_BOX_SIZE, grid_size=TRAIN_GRID_SIZE, noise_level=TRAIN_NOISE_LEVEL)
+        val_input, val_target = crop_and_rasterize_dynamic(train_structures)
         val_dataset.append((val_input, val_target))
         if (idx + 1) % 50 == 0:
             torch.cuda.empty_cache()
 
     # Initialize U-Net, optimizer, and scheduler
-    model = UNet3D(in_channels=1, out_channels=1, init_features=UNET_INIT_FEATURES)
+    model = UNet3D()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SCHEDULER_T_MAX, eta_min=SCHEDULER_ETA_MIN)
     criterion = BCEDiceLoss()
@@ -574,13 +603,7 @@ if __name__ == "__main__":
     model.to(device)
     print(f"Running on computational device: {device}")
 
-    peak_finder = BatchedMeanShiftPeakFinder3D(
-        threshold=DEFAULT_PEAK_THRESHOLD,
-        bandwidth=DEFAULT_PEAK_BANDWIDTH,
-        max_peaks=DEFAULT_MAX_PEAKS,
-        box_size=DEFAULT_BOX_SIZE,
-        iterations=DEFAULT_PEAK_ITERATIONS
-    )
+    peak_finder = BatchedMeanShiftPeakFinder3D()
     peak_finder.to(device)
 
     print("\n" + "="*75)
@@ -598,8 +621,8 @@ if __name__ == "__main__":
             batch_indices = shuffled_indices[i : i + BATCH_SIZE]
             batch_samples = [train_dataset[idx] for idx in batch_indices]
 
-            inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)  # [B, 1, 32, 32, 32]
-            targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device) # [B, 1, 32, 32, 32]
+            inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)
+            targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device)
 
             # Apply boundary-preserving random 3D flips and rotations
             inputs, targets = augment_batch_3d(inputs, targets)
@@ -660,7 +683,7 @@ if __name__ == "__main__":
     test_dataset = []
     for _ in range(NUM_TEST_CROPS):
         test_in, test_tgt, test_coords = crop_and_rasterize_dynamic(
-            test_structures, box_size=DEFAULT_BOX_SIZE, grid_size=TRAIN_GRID_SIZE, noise_level=TRAIN_NOISE_LEVEL, return_coords=True
+            test_structures, return_coords=True
         )
         test_dataset.append((test_in, test_tgt, test_coords))
 

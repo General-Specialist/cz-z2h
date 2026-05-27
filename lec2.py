@@ -116,8 +116,8 @@ def load_and_crop_pdb(filepath: str, box_size: float = 16.0) -> tuple[torch.Tens
 
 def coords_to_density(coords: torch.Tensor, box_size: float = 16.0, grid_size: int = 32, sigma: float = 0.8) -> torch.Tensor:
     """
-    Vectorized and differentiable 3D density rasterization directly in memory.
-    Assumes coords are pre-mapped into the physical space of the box: [0, box_size]^3.
+    Vectorized, differentiable, and chunked 3D density rasterization.
+    Processes coordinates in chunks to limit GPU memory footprint to 134 MB and prevent CUDA OOM.
     """
     if coords.shape[0] == 0:
         return torch.zeros((grid_size, grid_size, grid_size), device=coords.device)
@@ -127,17 +127,111 @@ def coords_to_density(coords: torch.Tensor, box_size: float = 16.0, grid_size: i
     ticks = torch.linspace(0.0, box_size, grid_size, device=device)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
+    g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
 
-    # Compute squared distances between every grid voxel and every atom coordinate
-    grid_expanded = grid.unsqueeze(-2) # Shape: [G, G, G, 1, 3]
-    coords_expanded = coords[None, None, None, :, :] # Shape: [1, 1, 1, N, 3]
+    g2 = torch.sum(g_flat ** 2, dim=-1, keepdim=True) # Shape: [G^3, 1]
+    density_flat = torch.zeros(g_flat.shape[0], device=device)
+    
+    # Process atoms in chunks to cap GPU memory footprint
+    chunk_size = 128
+    for i in range(0, coords.shape[0], chunk_size):
+        c_chunk = coords[i : i + chunk_size]
+        c2_chunk = torch.sum(c_chunk ** 2, dim=-1, keepdim=True).t() # Shape: [1, chunk]
+        
+        sq_dists_chunk = g2 + c2_chunk - 2.0 * torch.matmul(g_flat, c_chunk.t())
+        sq_dists_chunk = torch.clamp(sq_dists_chunk, min=0.0)
+        
+        atom_densities_chunk = torch.exp(-sq_dists_chunk / (2 * (sigma ** 2)))
+        density_flat += atom_densities_chunk.sum(dim=-1)
+        
+    return density_flat.view(grid_size, grid_size, grid_size)
 
-    sq_distances = torch.sum((grid_expanded - coords_expanded) ** 2, dim=-1) # Shape: [G, G, G, N]
 
-    # Apply Gaussian radial basis function to construct the continuous map
-    atom_densities = torch.exp(-sq_distances / (2 * (sigma ** 2)))
-    density_map = atom_densities.sum(dim=-1) # Shape: [G, G, G]
-    return density_map
+def coords_to_binary_grid(coords: torch.Tensor, box_size: float = 16.0, grid_size: int = 32, radius: float = 0.8) -> torch.Tensor:
+    """
+    Vectorized, differentiable, and chunked 3D binary grid rasterizer.
+    Processes coordinates in chunks to limit GPU memory footprint to 134 MB and prevent CUDA OOM.
+    """
+    if coords.shape[0] == 0:
+        return torch.zeros((grid_size, grid_size, grid_size), device=coords.device)
+
+    device = coords.device
+    # Generate the 3D grid ticks
+    ticks = torch.linspace(0.0, box_size, grid_size, device=device)
+    grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
+    grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
+    g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
+
+    g2 = torch.sum(g_flat ** 2, dim=-1, keepdim=True) # Shape: [G^3, 1]
+    min_dists_flat = torch.full((g_flat.shape[0],), float('inf'), device=device)
+    
+    # Process atoms in chunks to cap GPU memory footprint
+    chunk_size = 128
+    for i in range(0, coords.shape[0], chunk_size):
+        c_chunk = coords[i : i + chunk_size]
+        c2_chunk = torch.sum(c_chunk ** 2, dim=-1, keepdim=True).t() # Shape: [1, chunk]
+        
+        sq_dists_chunk = g2 + c2_chunk - 2.0 * torch.matmul(g_flat, c_chunk.t())
+        sq_dists_chunk = torch.clamp(sq_dists_chunk, min=0.0)
+        dists_chunk = sq_dists_chunk.sqrt()
+        
+        chunk_min, _ = torch.min(dists_chunk, dim=-1)
+        min_dists_flat = torch.min(min_dists_flat, chunk_min)
+        
+    binary_grid_flat = (min_dists_flat <= radius).float()
+    return binary_grid_flat.view(grid_size, grid_size, grid_size)
+
+
+def augment_batch_3d(inputs: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Applies boundary-preserving random 3D rotations and flips to the batch.
+    Inputs and targets shapes: [B, 1, H, W, D].
+    """
+    B = inputs.shape[0]
+    augmented_inputs = []
+    augmented_targets = []
+    
+    for b in range(B):
+        x = inputs[b]
+        y = targets[b]
+        
+        # 1. Random Flips (Reflections) - perfectly boundary-preserving
+        for dim in (-3, -2, -1):
+            if random.random() > 0.5:
+                x = torch.flip(x, dims=[dim])
+                y = torch.flip(y, dims=[dim])
+                
+        # 2. Random 90-degree Rotations - perfectly boundary-preserving
+        for plane in [(-3, -2), (-2, -1), (-3, -1)]:
+            k = random.randint(0, 3)
+            if k > 0:
+                x = torch.rot90(x, k, dims=plane)
+                y = torch.rot90(y, k, dims=plane)
+                
+        augmented_inputs.append(x)
+        augmented_targets.append(y)
+        
+    return torch.stack(augmented_inputs), torch.stack(augmented_targets)
+
+
+class BCEDiceLoss(nn.Module):
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # pred contains sigmoid probabilities
+        bce = F.binary_cross_entropy(pred, target, reduction='mean')
+        
+        # Soft Dice Loss
+        pred_flat = pred.view(pred.shape[0], -1)
+        target_flat = target.view(target.shape[0], -1)
+        
+        intersection = torch.sum(pred_flat * target_flat, dim=-1)
+        union = torch.sum(pred_flat, dim=-1) + torch.sum(target_flat, dim=-1)
+        
+        dice = 1.0 - (2.0 * intersection + self.eps) / (union + self.eps)
+        return bce + dice.mean()
 
 
 def generate_cryo_em_sample(filepaths: list[str], box_size: float = 16.0, grid_size: int = 32, noise_level: float = 0.05) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -176,6 +270,43 @@ def generate_cryo_em_sample(filepaths: list[str], box_size: float = 16.0, grid_s
 # SECTION 2: THE 3D U-NET ARCHITECTURE (Volumetric Segmenter)
 # ==============================================================================
 
+class ChannelAttention3D(nn.Module):
+    """
+    3D Squeeze-and-Excitation Channel Attention module.
+    """
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C = x.shape[0], x.shape[1]
+        weights = self.fc(x).view(B, C, 1, 1, 1)
+        return x * weights
+
+
+class SpatialAttention3D(nn.Module):
+    """
+    3D Spatial Attention module using average and max pooling descriptors.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = nn.Conv3d(2, 1, kernel_size=3, padding=1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        mean_out = torch.mean(x, dim=1, keepdim=True)
+        combined = torch.cat([max_out, mean_out], dim=1)
+        weights = torch.sigmoid(self.conv(combined))
+        return x * weights
+
+
 class DoubleConv3D(nn.Module):
     """
     Fundamental 3D building block: (Conv3D -> BatchNorm3D -> ReLU) * 2.
@@ -198,10 +329,7 @@ class DoubleConv3D(nn.Module):
 
 class UNet3D(nn.Module):
     """
-    Fully batched and parameterized 3D U-Net Segmenter.
-    Downsamples the 3D density grid using MaxPool3D to extract multi-scale spatial features,
-    then upsamples using ConvTranspose3D while concatenating high-resolution skip features
-    directly from the encoder path to preserve exact atomic boundaries.
+    Fully batched and parameterized 3D U-Net Segmenter with Channel & Spatial Attention.
     """
     def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 8) -> None:
         super().__init__()
@@ -216,13 +344,16 @@ class UNet3D(nn.Module):
 
         # --- Bottleneck ---
         self.bottleneck = DoubleConv3D(F_dim * 2, F_dim * 4)
+        self.bottleneck_att = ChannelAttention3D(F_dim * 4)
 
         # --- Decoder (Upsampling Path) ---
         self.up1 = nn.ConvTranspose3d(F_dim * 4, F_dim * 2, kernel_size=2, stride=2)  # Upsamples: 8^3 -> 16^3
         self.conv_up1 = DoubleConv3D(F_dim * 4, F_dim * 2)
+        self.att1 = SpatialAttention3D()
 
         self.up2 = nn.ConvTranspose3d(F_dim * 2, F_dim, kernel_size=2, stride=2)  # Upsamples: 16^3 -> 32^3
         self.conv_up2 = DoubleConv3D(F_dim * 2, F_dim)
+        self.att2 = SpatialAttention3D()
 
         self.out_conv = nn.Conv3d(F_dim, out_channels, kernel_size=1)
 
@@ -236,78 +367,121 @@ class UNet3D(nn.Module):
 
         # --- Bottleneck ---
         b = self.bottleneck(p2)         # Shape: [B, 4*F_dim, 8, 8, 8]
+        b = self.bottleneck_att(b)
 
         # --- Decoder ---
         u1 = self.up1(b)                # Shape: [B, 2*F_dim, 16, 16, 16]
         c1 = torch.cat([u1, x2], dim=1) # Skip connection
         x3 = self.conv_up1(c1)          # Shape: [B, 2*F_dim, 16, 16, 16]
+        x3 = self.att1(x3)
 
         u2 = self.up2(x3)               # Shape: [B, F_dim, 32, 32, 32]
         c2 = torch.cat([u2, x1], dim=1) # Skip connection
         x4 = self.conv_up2(c2)          # Shape: [B, F_dim, 32, 32, 32]
+        x4 = self.att2(x4)
 
         out = self.out_conv(x4)
-        return out
+        return torch.sigmoid(out)
 
 
 # ==============================================================================
 # SECTION 3: 3D NON-MAXIMUM SUPPRESSION (Peak-Finders)
 # ==============================================================================
 
-class BatchedPeakFinder3D(nn.Module):
+class BatchedMeanShiftPeakFinder3D(nn.Module):
     """
-    Bridges the dense 3D voxel grid with sequence representations by extracting
-    a fixed number (M) of high-confidence spatial landmarks (support points).
+    Continuous 3D Mean-Shift Clustering Peak Finder natively in PyTorch on GPU.
+    Seek mode centers in real continuous space with sub-voxel precision.
     """
-    def __init__(self, threshold: float = 0.15, kernel_size: int = 3, max_peaks: int = 16, box_size: float = 16.0) -> None:
+    def __init__(self, threshold: float = 0.30, bandwidth: float = 1.0, max_peaks: int = 128, box_size: float = 16.0, iterations: int = 5) -> None:
         super().__init__()
         self.threshold = threshold
-        self.kernel_size = kernel_size
+        self.bandwidth = bandwidth
         self.max_peaks = max_peaks
         self.box_size = box_size
+        self.iterations = iterations
 
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, X, Y, Z = density.shape
-        assert C == 1, "Peak finder expects single-channel density map"
-
+        assert C == 1, "Mean-shift peak finder expects single-channel density map"
         device = density.device
-        padding = self.kernel_size // 2
-
-        # 1. Isolate local maxima using a 3D max-pooling filter
-        max_pooled = F.max_pool3d(density, kernel_size=self.kernel_size, stride=1, padding=padding)
-        is_peak_mask = (density == max_pooled) & (density > self.threshold)
-
+        
         M = self.max_peaks
         out_coords = torch.zeros((B, M, 3), dtype=torch.float32, device=device)
         out_values = torch.zeros((B, M), dtype=torch.float32, device=device)
         out_mask = torch.zeros((B, M), dtype=torch.bool, device=device)
 
         ticks = torch.linspace(0.0, self.box_size, X, device=device)
+        grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
+        grid_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [X, Y, Z, 3]
+        flat_grid = grid_coords.view(-1, 3) # Shape: [X*Y*Z, 3]
+        spacing = self.box_size / (X - 1)
+
+        # 3D MaxPool filter to select high-quality starting seeds
+        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
+        is_peak_mask = (density == max_pooled) & (density > self.threshold)
 
         for b in range(B):
-            sample_peaks = is_peak_mask[b, 0]
-            indices = torch.nonzero(sample_peaks)
+            sample_density = density[b, 0] # [X, Y, Z]
+            sample_peaks = is_peak_mask[b, 0] # [X, Y, Z]
 
-            if indices.shape[0] == 0:
+            # 1. Extract active coordinates and weights for distance computations
+            active_mask = sample_density > self.threshold
+            active_coords = flat_grid[active_mask.view(-1)] # [A, 3]
+            active_weights = sample_density[active_mask] # [A]
+
+            if active_coords.shape[0] == 0:
                 continue
 
-            values = density[b, 0][sample_peaks]
-            sorted_indices = torch.argsort(values, descending=True)
-            indices = indices[sorted_indices]
-            values = values[sorted_indices]
+            # 2. Extract local max-pooling peaks as starting seeds
+            seeds = flat_grid[sample_peaks.view(-1)] # [S, 3]
+            if seeds.shape[0] == 0:
+                continue
 
-            num_to_copy = min(indices.shape[0], M)
+            seed_probs = sample_density[sample_peaks]
+            sorted_idx = torch.argsort(seed_probs, descending=True)
+            seeds = seeds[sorted_idx[:M]]
 
+            # 3. Iterative Mean-Shift seeks in continuous space
+            for _ in range(self.iterations):
+                s2 = torch.sum(seeds ** 2, dim=-1, keepdim=True) # [S, 1]
+                a2 = torch.sum(active_coords ** 2, dim=-1, keepdim=True).t() # [1, A]
+                sq_dists = s2 + a2 - 2.0 * torch.matmul(seeds, active_coords.t()) # [S, A]
+                sq_dists = torch.clamp(sq_dists, min=0.0)
+
+                weights = torch.exp(-sq_dists / (2.0 * (self.bandwidth ** 2))) # [S, A]
+                total_weights = weights * active_weights.unsqueeze(0) # [S, A]
+
+                denominator = torch.sum(total_weights, dim=-1, keepdim=True) + 1e-8
+                new_seeds = torch.matmul(total_weights, active_coords) / denominator
+                seeds = new_seeds
+
+            # 4. Final seed confidence lookup
+            grid_indices = torch.round(seeds / spacing).long()
+            grid_indices = torch.clamp(grid_indices, 0, X - 1)
+            final_probs = sample_density[grid_indices[:, 0], grid_indices[:, 1], grid_indices[:, 2]]
+
+            # Sort final seeds by confidence
+            sorted_idx = torch.argsort(final_probs, descending=True)
+            seeds = seeds[sorted_idx]
+            final_probs = final_probs[sorted_idx]
+
+            # 5. Greedy spatial deduplication to resolve overlaps (0.6 Å clash limit)
+            keep_mask = torch.ones(seeds.shape[0], dtype=torch.bool, device=device)
+            for idx in range(seeds.shape[0]):
+                if not keep_mask[idx]:
+                    continue
+                other_dists = torch.sum((seeds[idx+1:] - seeds[idx]) ** 2, dim=-1).sqrt()
+                clash_mask = other_dists < 0.6
+                keep_mask[idx+1:][clash_mask] = False
+
+            seeds = seeds[keep_mask]
+            final_probs = final_probs[keep_mask]
+
+            num_to_copy = min(seeds.shape[0], M)
             if num_to_copy > 0:
-                selected_indices = indices[:num_to_copy]
-
-                # Map grid indices to physical Angstrom coordinates in the box
-                phys_x = ticks[selected_indices[:, 0]]
-                phys_y = ticks[selected_indices[:, 1]]
-                phys_z = ticks[selected_indices[:, 2]]
-
-                out_coords[b, :num_to_copy] = torch.stack([phys_x, phys_y, phys_z], dim=-1)
-                out_values[b, :num_to_copy] = values[:num_to_copy]
+                out_coords[b, :num_to_copy] = seeds[:num_to_copy]
+                out_values[b, :num_to_copy] = final_probs[:num_to_copy]
                 out_mask[b, :num_to_copy] = True
 
         return out_coords, out_values, out_mask
@@ -353,8 +527,8 @@ if __name__ == "__main__":
             structure = gemmi.read_structure(filepath)
             all_atoms = []
             carbon_atoms = []
-            for model in structure:
-                for chain in model:
+            for struct_model in structure:
+                for chain in struct_model:
                     for residue in chain:
                         res_name = residue.name.strip().upper()
                         if res_name not in PROTEIN_RESIDUES:
@@ -375,7 +549,7 @@ if __name__ == "__main__":
         raise ValueError("Could not parse any protein structures into memory.")
 
     # Dynamic dynamic-cropping function
-    def crop_and_rasterize_dynamic(structures: list, box_size: float = 16.0, grid_size: int = 32, noise_level: float = 0.04) -> tuple[torch.Tensor, torch.Tensor]:
+    def crop_and_rasterize_dynamic(structures: list, box_size: float = 16.0, grid_size: int = 32, noise_level: float = 0.04, return_coords: bool = False) -> tuple:
         # Pick a random structure
         all_coords, carbon_coords = random.choice(structures)
 
@@ -403,41 +577,47 @@ if __name__ == "__main__":
         noise = torch.randn_like(input_density) * noise_level
         input_density = F.relu(input_density + noise)
 
-        target_density = coords_to_density(cropped_carbon_centered, box_size=box_size, grid_size=grid_size, sigma=0.6)
+        target_density = coords_to_binary_grid(cropped_carbon_centered, box_size=box_size, grid_size=grid_size, radius=0.8)
 
+        if return_coords:
+            return input_density, target_density, cropped_carbon_centered
         return input_density, target_density
 
     # Pre-cache training and validation datasets at startup to prevent CPU bottlenecks
-    print("\nPre-caching 160 training crops from PDB structures...")
+    print("\nPre-caching 640 training crops from PDB structures...")
     train_dataset = []
-    for _ in range(160):
-        train_input, train_target = crop_and_rasterize_dynamic(train_structures, box_size=16.0, grid_size=32, noise_level=0.04)
+    for idx in range(640):
+        train_input, train_target = crop_and_rasterize_dynamic(train_structures, box_size=16.0, grid_size=64, noise_level=0.04)
         train_dataset.append((train_input, train_target))
+        if (idx + 1) % 50 == 0:
+            torch.cuda.empty_cache()
 
-    print("Pre-caching 40 validation crops...")
+    print("Pre-caching 120 validation crops...")
     val_dataset = []
-    for _ in range(40):
-        val_input, val_target = crop_and_rasterize_dynamic(train_structures, box_size=16.0, grid_size=32, noise_level=0.04)
+    for idx in range(120):
+        val_input, val_target = crop_and_rasterize_dynamic(train_structures, box_size=16.0, grid_size=64, noise_level=0.04)
         val_dataset.append((val_input, val_target))
+        if (idx + 1) % 50 == 0:
+            torch.cuda.empty_cache()
 
     # Initialize U-Net, optimizer, and scheduler
-    model = UNet3D(in_channels=1, out_channels=1, init_features=16)
+    model = UNet3D(in_channels=1, out_channels=1, init_features=32)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40, eta_min=1e-5)
-    criterion = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=60, eta_min=1e-5)
+    criterion = BCEDiceLoss()
 
     # Select execution device
     model.to(device)
     print(f"Running on computational device: {device}")
 
-    peak_finder = BatchedPeakFinder3D(threshold=0.15, max_peaks=128, box_size=16.0)
+    peak_finder = BatchedMeanShiftPeakFinder3D(threshold=0.30, bandwidth=1.0, max_peaks=128, box_size=16.0, iterations=5)
     peak_finder.to(device)
 
     print("\n" + "="*75)
     print(" RUNNING REAL PDB U-NET GENERALIZATION TRAINING ")
     print("="*75)
 
-    epochs = 40
+    epochs = 60
     batch_size = 8
 
     for epoch in range(1, epochs + 1):
@@ -453,6 +633,9 @@ if __name__ == "__main__":
 
             inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)  # [B, 1, 32, 32, 32]
             targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device) # [B, 1, 32, 32, 32]
+
+            # Apply boundary-preserving random 3D flips and rotations
+            inputs, targets = augment_batch_3d(inputs, targets)
 
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -478,50 +661,80 @@ if __name__ == "__main__":
 
         scheduler.step()
 
-        if epoch % 5 == 0 or epoch == 1:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"Epoch {epoch:02d}/{epochs} | LR: {current_lr:.6f} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch:02d}/{epochs} | LR: {current_lr:.6f} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
     # Evaluation on a completely unseen real protein (Crambin 1CRN)
     print("\n" + "="*75)
     print(" EVALUATION ON UNSEEN PDB STRUCTURE: CRAMBIN (1CRN) ")
     print("="*75)
 
-    test_input, test_target, test_gt_coords = generate_cryo_em_sample([test_file], box_size=16.0, grid_size=32, noise_level=0.04)
+    # 1. Load Crambin structure coordinates once to accelerate test evaluation
+    try:
+        test_structure = gemmi.read_structure(test_file)
+        test_atoms = []
+        test_carbons = []
+        for struct_model in test_structure:
+            for chain in struct_model:
+                for residue in chain:
+                    res_name = residue.name.strip().upper()
+                    if res_name not in PROTEIN_RESIDUES:
+                        continue
+                    for atom in residue:
+                        pos = [atom.pos.x, atom.pos.y, atom.pos.z]
+                        test_atoms.append(pos)
+                        if atom.element.name.strip().upper() == "C":
+                            test_carbons.append(pos)
+        test_all_coords = torch.tensor(test_atoms, dtype=torch.float32).to(device)
+        test_carbon_coords = torch.tensor(test_carbons, dtype=torch.float32).to(device)
+        test_structures = [(test_all_coords, test_carbon_coords)]
+    except Exception as e:
+        print(f"Error parsing Crambin test file: {e}")
+        raise e
+
+    # 2. Pre-cache 20 distinct crops from Crambin to construct a robust benchmark
+    print("Pre-caching 20 unseen Crambin test crops...")
+    test_dataset = []
+    for _ in range(20):
+        test_in, test_tgt, test_coords = crop_and_rasterize_dynamic(
+            test_structures, box_size=16.0, grid_size=64, noise_level=0.04, return_coords=True
+        )
+        test_dataset.append((test_in, test_tgt, test_coords))
 
     model.eval()
+    total_gt_carbons = 0
+    total_matched_carbons = 0
+    total_resolved_peaks = 0
+
+    print("\nEvaluating model over 20 test crops...")
     with torch.no_grad():
-        test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
-        pred_density = F.relu(model(test_in_batch))
-        pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+        for test_idx, (test_input, test_target, test_gt_coords) in enumerate(test_dataset):
+            test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
+            pred_density = F.relu(model(test_in_batch))
+            pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
 
-    pred_coords = pred_coords[0].cpu()
-    pred_mask = pred_mask[0].cpu()
-    pred_vals = pred_vals[0].cpu()
+            pred_coords = pred_coords[0].cpu()
+            pred_mask = pred_mask[0].cpu()
 
-    num_pred_peaks = pred_mask.sum().item()
-    num_gt_peaks = len(test_gt_coords)
+            num_pred_peaks = pred_mask.sum().item()
+            num_gt_peaks = len(test_gt_coords)
 
-    print(f"Unseen test Crambin crop has {num_gt_peaks} Ground Truth Carbon atoms.")
-    print(f"U-Net + Peak Finder resolved {num_pred_peaks} peaks.\n")
+            total_resolved_peaks += num_pred_peaks
+            total_gt_carbons += num_gt_peaks
 
-    print("Matched Recovered Coordinates vs Ground Truth (Within 1.0 A Tolerance):")
-    matched_count = 0
+            matched_count = 0
+            for gt_c in test_gt_coords:
+                if num_pred_peaks > 0:
+                    distances = torch.norm(pred_coords[:num_pred_peaks] - gt_c.cpu(), dim=-1)
+                    min_dist, min_idx = torch.min(distances, dim=0)
+                    if min_dist.item() <= 1.0:
+                        matched_count += 1
+            total_matched_carbons += matched_count
 
-    for gt_idx, gt_c in enumerate(test_gt_coords):
-        if num_pred_peaks > 0:
-            distances = torch.norm(pred_coords[:num_pred_peaks] - gt_c, dim=-1)
-            min_dist, min_idx = torch.min(distances, dim=0)
-            if min_dist.item() <= 1.0:
-                matched_count += 1
-                pred_c = pred_coords[min_idx]
-                val = pred_vals[min_idx]
-                print(f"  GT Carbon {gt_idx+1:02d}: [{gt_c[0]:.2f}, {gt_c[1]:.2f}, {gt_c[2]:.2f}] -> RESOLVED (Error: {min_dist.item():.3f} Å, Conf: {val:.3f})")
-            else:
-                print(f"  GT Carbon {gt_idx+1:02d}: [{gt_c[0]:.2f}, {gt_c[1]:.2f}, {gt_c[2]:.2f}] -> MISSED (Closest prediction is {min_dist.item():.3f} Å away)")
-        else:
-            print(f"  GT Carbon {gt_idx+1:02d}: [{gt_c[0]:.2f}, {gt_c[1]:.2f}, {gt_c[2]:.2f}] -> MISSED (No peaks predicted)")
-
-    accuracy = (matched_count / num_gt_peaks) * 100
-    print(f"\nCoordinate Recovery Accuracy: {accuracy:.1f}% ({matched_count}/{num_gt_peaks} carbons resolved within 1.0 Å)")
+    avg_accuracy = (total_matched_carbons / total_gt_carbons) * 100 if total_gt_carbons > 0 else 0.0
+    print(f"\nEvaluated over {len(test_dataset)} unseen Crambin crops.")
+    print(f"Average U-Net + Peak Finder resolved peaks per crop: {total_resolved_peaks / len(test_dataset):.1f}")
+    print(f"Total Ground Truth Carbons across all crops: {total_gt_carbons}")
+    print(f"Total Matched Carbons: {total_matched_carbons}")
+    print(f"\nOverall Coordinate Recovery Accuracy: {avg_accuracy:.1f}% ({total_matched_carbons}/{total_gt_carbons} carbons resolved within 1.0 Å)")
     print("="*75)

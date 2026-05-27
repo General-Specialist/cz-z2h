@@ -22,6 +22,10 @@ PROTEIN_RESIDUES = {
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
 }
 
+# Stable, sorted list of standard amino acids for multi-class indexing
+AMINO_ACID_LIST = sorted(list(PROTEIN_RESIDUES))
+AMINO_ACID_MAP = {aa: idx + 1 for idx, aa in enumerate(AMINO_ACID_LIST)} # Class 0 is reserved for background
+
 # Directories and Dataset Paths
 DEFAULT_SAVE_DIR = "./pdb_data"
 TRAIN_PDB_IDS = [
@@ -32,7 +36,7 @@ TRAIN_PDB_IDS = [
 TEST_PDB_ID = "1crn"
 
 # Volumetric & Rasterization Grid Configuration
-DEFAULT_BOX_SIZE = 16.0
+DEFAULT_BOX_SIZE = 8.0
 GRID_SIZE = 32
 
 # Gaussian Rasterization Sigmas
@@ -102,7 +106,7 @@ PEAK_FINDER_EPSILON = 1e-8
 
 
 # ==============================================================================
-# SECTION 1: UTILITIES, PIPELINES & DATA AUGMENTATION
+# UTILITIES, PIPELINES & DATA AUGMENTATION
 # ==============================================================================
 
 def download_pdb_cif(pdb_id: str) -> str:
@@ -113,12 +117,12 @@ def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
     atoms = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
     protein_atoms = atoms[np.isin(atoms.res_name, list(PROTEIN_RESIDUES))]
     all_coords = torch.tensor(protein_atoms.coord, dtype=torch.float32)
-    carbon_coords = torch.tensor(protein_atoms.coord[protein_atoms.element == "C"], dtype=torch.float32)
-    return all_coords, carbon_coords
+    res_indices = torch.tensor([AMINO_ACID_MAP[name] for name in protein_atoms.res_name], dtype=torch.long)
+    return all_coords, res_indices
 
 
 def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
-    all_coords, carbon_coords = load_coords_biotite(filepath)
+    all_coords, res_indices = load_coords_biotite(filepath)
 
     # Select a random atom as the local crop anchor
     num_atoms = all_coords.shape[0]
@@ -127,16 +131,16 @@ def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
 
     # Keep coordinates falling inside the local box bounds around center_atom
     half_box = DEFAULT_BOX_SIZE / 2.0
+    mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
 
-    cropped_all = all_coords[torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)]
-    cropped_carbon = carbon_coords[torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)]
+    cropped_all = all_coords[mask]
+    cropped_res_indices = res_indices[mask]
 
     # Shift coordinates so that center_atom is centered exactly at [DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2]
     # This maps the cropped region exactly into the [0, DEFAULT_BOX_SIZE]^3 voxel space.
     cropped_all_centered = cropped_all - center_atom + half_box
-    cropped_carbon_centered = cropped_carbon - center_atom + half_box
 
-    return cropped_all_centered, cropped_carbon_centered
+    return cropped_all_centered, cropped_res_indices
 
 
 def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -207,36 +211,89 @@ def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
     return binary_grid_flat.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
 
-def augment_batch_3d(inputs: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def coords_to_residue_grid(coords: torch.Tensor, res_indices: torch.Tensor) -> torch.Tensor:
+    """
+    Vectorized, differentiable, and chunked 3D residue grid rasterizer.
+    Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
+    Assigns each voxel the class index of the closest atom within DEFAULT_RADIUS,
+    otherwise 0 (background).
+    """
+    if coords.shape[0] == 0:
+        return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), dtype=torch.long, device=coords.device)
+
+    device = coords.device
+    # Generate the 3D grid ticks
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
+    grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
+    grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
+    g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
+
+    g2 = torch.sum(g_flat ** 2, dim=-1, keepdim=True) # Shape: [G^3, 1]
+    min_dists_flat = torch.full((g_flat.shape[0],), float('inf'), device=device)
+    nearest_indices = torch.full((g_flat.shape[0],), -1, dtype=torch.long, device=device)
+
+    # Process atoms in chunks to cap GPU memory footprint
+    chunk_size = RASTER_CHUNK_SIZE
+    for i in range(0, coords.shape[0], chunk_size):
+        c_chunk = coords[i : i + chunk_size]
+        c2_chunk = torch.sum(c_chunk ** 2, dim=-1, keepdim=True).t() # Shape: [1, chunk]
+
+        sq_dists_chunk = g2 + c2_chunk - 2.0 * torch.matmul(g_flat, c_chunk.t())
+        sq_dists_chunk = torch.clamp(sq_dists_chunk, min=0.0)
+        dists_chunk = sq_dists_chunk.sqrt()
+
+        chunk_min, chunk_arg = torch.min(dists_chunk, dim=-1)
+        update_mask = chunk_min < min_dists_flat
+        min_dists_flat[update_mask] = chunk_min[update_mask]
+        nearest_indices[update_mask] = chunk_arg[update_mask] + i
+
+    # Map nearest indices to residue indices
+    residue_grid_flat = torch.zeros(g_flat.shape[0], dtype=torch.long, device=device)
+    valid_mask = min_dists_flat <= DEFAULT_RADIUS
+    residue_grid_flat[valid_mask] = res_indices[nearest_indices[valid_mask]]
+
+    return residue_grid_flat.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+
+
+def augment_batch_3d_joint(
+    inputs: torch.Tensor,
+    atom_targets: torch.Tensor,
+    residue_targets: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Applies boundary-preserving random 3D rotations and flips to the batch.
-    Inputs and targets shapes: [B, 1, H, W, D].
+    Applies the exact same transformation to the input, atom detection targets, and residue classification targets.
     """
     B = inputs.shape[0]
     augmented_inputs = []
-    augmented_targets = []
+    augmented_atoms = []
+    augmented_residues = []
 
     for b in range(B):
         x = inputs[b]
-        y = targets[b]
+        y_atom = atom_targets[b]
+        y_res = residue_targets[b]
 
         # 1. Random Flips (Reflections) - boundary-preserving
         for dim in (-3, -2, -1):
             if random.random() > AUGMENT_FLIP_PROB:
                 x = torch.flip(x, dims=[dim])
-                y = torch.flip(y, dims=[dim])
+                y_atom = torch.flip(y_atom, dims=[dim])
+                y_res = torch.flip(y_res, dims=[dim])
 
         # 2. Random 90-degree Rotations - boundary-preserving
         for plane in [(-3, -2), (-2, -1), (-3, -1)]:
             k = random.randint(0, 3)
             if k > 0:
                 x = torch.rot90(x, k, dims=plane)
-                y = torch.rot90(y, k, dims=plane)
+                y_atom = torch.rot90(y_atom, k, dims=plane)
+                y_res = torch.rot90(y_res, k, dims=plane)
 
         augmented_inputs.append(x)
-        augmented_targets.append(y)
+        augmented_atoms.append(y_atom)
+        augmented_residues.append(y_res)
 
-    return torch.stack(augmented_inputs), torch.stack(augmented_targets)
+    return torch.stack(augmented_inputs), torch.stack(augmented_atoms), torch.stack(augmented_residues)
 
 
 class BCEDiceLoss(nn.Module):
@@ -257,24 +314,28 @@ class BCEDiceLoss(nn.Module):
         return bce + dice.mean()
 
 
-def generate_cryo_em_sample(filepaths: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def generate_cryo_em_sample(filepaths: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Crops a local spatial sub-volume from a random protein and rasterizes:
     - Input: all atoms, wider blur (lower resolution), with added Gaussian noise.
-    - Target: carbon atoms only, sharp blur, clean.
+    - Target 1: all atoms, sharp blur, clean.
+    - Target 2: residue class voxel grid.
     """
     filepath = random.choice(filepaths)
-    all_coords, carbon_coords = load_and_crop_pdb(filepath)
+    all_coords, res_indices = load_and_crop_pdb(filepath)
 
     # Input map: all atoms, wider blur (simulating low-resolution cryo-EM map)
     input_density = coords_to_density(all_coords, sigma=INPUT_SIGMA)
     noise = torch.randn_like(input_density) * DEFAULT_NOISE_LEVEL
     input_density = F.relu(input_density + noise) # clamp negative densities to 0
 
-    # Target map: carbons only, sharp blur (simulating ground-truth carbon positions)
-    target_density = coords_to_density(carbon_coords, sigma=TARGET_SIGMA)
+    # Target 1 map: all atoms, binary grid
+    target_density = coords_to_binary_grid(all_coords)
 
-    return input_density, target_density, carbon_coords
+    # Target 2 map: residue class grid
+    target_residue = coords_to_residue_grid(all_coords, res_indices)
+
+    return input_density, target_density, target_residue, all_coords
 
 
 # ==============================================================================
@@ -342,12 +403,12 @@ class UNet3D(nn.Module):
     """
     Fully batched and parameterized 3D U-Net Segmenter with Channel & Spatial Attention.
     """
-    def __init__(self) -> None:
+    def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 32) -> None:
         super().__init__()
-        F_dim = UNET_INIT_FEATURES
+        F_dim = init_features
 
         # --- Encoder (Downsampling Path) ---
-        self.down1 = DoubleConv3D(UNET_IN_CHANNELS, F_dim)
+        self.down1 = DoubleConv3D(in_channels, F_dim)
         self.pool1 = nn.MaxPool3d(kernel_size=POOL_KERNEL_SIZE, stride=POOL_STRIDE)
 
         self.down2 = DoubleConv3D(F_dim, F_dim * 2)
@@ -366,7 +427,7 @@ class UNet3D(nn.Module):
         self.conv_up2 = DoubleConv3D(F_dim * 2, F_dim)
         self.att2 = SpatialAttention3D()
 
-        self.out_conv = nn.Conv3d(F_dim, UNET_OUT_CHANNELS, kernel_size=OUT_CONV_KERNEL_SIZE)
+        self.out_conv = nn.Conv3d(F_dim, out_channels, kernel_size=OUT_CONV_KERNEL_SIZE)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # --- Encoder ---
@@ -392,7 +453,7 @@ class UNet3D(nn.Module):
         x4 = self.att2(x4)
 
         out = self.out_conv(x4)
-        return torch.sigmoid(out)
+        return out
 
 
 # ==============================================================================
@@ -498,33 +559,34 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
 # Dynamic cropping function using global constants
 def crop_and_rasterize_dynamic(structures: list, return_coords: bool = False) -> tuple:
     # Pick a random structure
-    all_coords, carbon_coords = random.choice(structures)
+    all_coords, res_indices = random.choice(structures)
 
     num_atoms = all_coords.shape[0]
     random_idx = torch.randint(0, num_atoms, (1,)).item()
     center_atom = all_coords[random_idx]
 
     half_box = DEFAULT_BOX_SIZE / 2.0
-    carbon_mask = torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)
-    cropped_carbon = carbon_coords[carbon_mask]
-
     all_mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
     cropped_all = all_coords[all_mask]
+    cropped_res_indices = res_indices[all_mask]
 
     # Shift coordinates to align inside the [0, DEFAULT_BOX_SIZE]^3 space
     cropped_all_centered = cropped_all - center_atom + half_box
-    cropped_carbon_centered = cropped_carbon - center_atom + half_box
 
-    # Rasterize inputs and targets on the fly
+    # Input: all atoms, wider blur (simulating low-resolution cryo-EM map)
     input_density = coords_to_density(cropped_all_centered, sigma=INPUT_SIGMA)
     noise = torch.randn_like(input_density) * TRAIN_NOISE_LEVEL
     input_density = F.relu(input_density + noise)
 
-    target_density = coords_to_binary_grid(cropped_carbon_centered)
+    # Target 1 (Atom Detection): binary grid of all atoms (clean)
+    target_density = coords_to_binary_grid(cropped_all_centered)
+
+    # Target 2 (Residue Classification): multi-class residue grid
+    target_residue = coords_to_residue_grid(cropped_all_centered, cropped_res_indices)
 
     if return_coords:
-        return input_density, target_density, cropped_carbon_centered
-    return input_density, target_density
+        return input_density, target_density, target_residue, cropped_all_centered, cropped_res_indices
+    return input_density, target_density, target_residue
 
 
 if __name__ == "__main__":
@@ -547,27 +609,39 @@ if __name__ == "__main__":
     print("\nLoading PDB structures into memory once...")
     train_structures = []
     for filepath in train_files:
-        all_coords, carbon_coords = load_coords_biotite(filepath)
-        train_structures.append((all_coords.to(device), carbon_coords.to(device)))
-        print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_coords)} | Carbons: {len(carbon_coords)}")
+        all_coords, res_indices = load_coords_biotite(filepath)
+        train_structures.append((all_coords.to(device), res_indices.to(device)))
+        print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_coords)}")
 
     # Pre-cache validation dataset (training set is sampled on-the-fly for infinite variations)
     print(f"\nPre-caching {NUM_VAL_CROPS} validation crops...")
     val_dataset = []
     for idx in range(NUM_VAL_CROPS):
-        val_input, val_target = crop_and_rasterize_dynamic(train_structures)
-        val_dataset.append((val_input, val_target))
+        val_input, val_target_atom, val_target_res = crop_and_rasterize_dynamic(train_structures)
+        val_dataset.append((val_input, val_target_atom, val_target_res))
         if (idx + 1) % 50 == 0:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # Initialize U-Net, optimizer, and scheduler
-    model = UNet3D()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SCHEDULER_T_MAX, eta_min=SCHEDULER_ETA_MIN)
-    criterion = BCEDiceLoss()
+    # Initialize Dual U-Nets: Atom Detection & Residue Classification
+    atom_model = UNet3D(in_channels=1, out_channels=1, init_features=UNET_INIT_FEATURES)
+    residue_model = UNet3D(in_channels=1, out_channels=21, init_features=UNET_INIT_FEATURES)
 
-    model.to(device)
+    # Move models to device
+    atom_model.to(device)
+    residue_model.to(device)
+
+    # Set up joint optimizer for both models
+    import itertools
+    optimizer = torch.optim.Adam(
+        itertools.chain(atom_model.parameters(), residue_model.parameters()),
+        lr=LEARNING_RATE
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SCHEDULER_T_MAX, eta_min=SCHEDULER_ETA_MIN)
+
+    criterion_atom = BCEDiceLoss()
+    criterion_residue = nn.CrossEntropyLoss()
+
     print(f"Running on computational device: {device}")
 
     peak_finder = BatchedMeanShiftPeakFinder3D()
@@ -583,7 +657,8 @@ if __name__ == "__main__":
     epochs_no_improve = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        model.train()
+        atom_model.train()
+        residue_model.train()
         train_loss = 0.0
 
         for step in range(steps_per_epoch):
@@ -591,14 +666,21 @@ if __name__ == "__main__":
             batch_samples = [crop_and_rasterize_dynamic(train_structures) for _ in range(BATCH_SIZE)]
 
             inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)
-            targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device)
+            atom_targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device)
+            residue_targets = torch.stack([sample[2] for sample in batch_samples]).long().to(device)
 
-            # Apply boundary-preserving random 3D flips and rotations
-            inputs, targets = augment_batch_3d(inputs, targets)
+            # Apply boundary-preserving random 3D flips and rotations jointly
+            inputs, atom_targets, residue_targets = augment_batch_3d_joint(inputs, atom_targets, residue_targets)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            
+            atom_preds = torch.sigmoid(atom_model(inputs))
+            residue_preds = residue_model(inputs)
+
+            loss_atom = criterion_atom(atom_preds, atom_targets)
+            loss_residue = criterion_residue(residue_preds, residue_targets)
+            loss = loss_atom + loss_residue
+            
             loss.backward()
             optimizer.step()
 
@@ -607,15 +689,22 @@ if __name__ == "__main__":
         train_loss /= (steps_per_epoch * BATCH_SIZE)
 
         # Validation evaluation on the stable, pre-cached set
-        model.eval()
+        atom_model.eval()
+        residue_model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for val_input, val_target in val_dataset:
+            for val_input, val_target_atom, val_target_res in val_dataset:
                 val_input_tensor = val_input.unsqueeze(0).unsqueeze(0).to(device)
-                val_target_tensor = val_target.unsqueeze(0).unsqueeze(0).to(device)
-                val_out = model(val_input_tensor)
-                loss = criterion(val_out, val_target_tensor)
-                val_loss += loss.item()
+                val_target_atom_tensor = val_target_atom.unsqueeze(0).unsqueeze(0).to(device)
+                val_target_res_tensor = val_target_res.unsqueeze(0).to(device)
+                
+                val_atom_pred = torch.sigmoid(atom_model(val_input_tensor))
+                val_res_pred = residue_model(val_input_tensor)
+                
+                loss_atom = criterion_atom(val_atom_pred, val_target_atom_tensor)
+                loss_residue = criterion_residue(val_res_pred, val_target_res_tensor)
+                
+                val_loss += (loss_atom + loss_residue).item()
             val_loss /= len(val_dataset)
 
         scheduler.step()
@@ -639,29 +728,36 @@ if __name__ == "__main__":
     print("="*75)
 
     # Load Crambin structure coordinates once to accelerate test evaluation
-    test_all_coords, test_carbon_coords = load_coords_biotite(test_file)
-    test_structures = [(test_all_coords.to(device), test_carbon_coords.to(device))]
+    test_all_coords, test_res_indices = load_coords_biotite(test_file)
+    test_structures = [(test_all_coords.to(device), test_res_indices.to(device))]
 
     # Pre-cache test crops from Crambin to construct a robust benchmark
     print(f"Pre-caching {NUM_TEST_CROPS} unseen Crambin test crops...")
     test_dataset = []
     for _ in range(NUM_TEST_CROPS):
-        test_in, test_tgt, test_coords = crop_and_rasterize_dynamic(
+        test_in, test_tgt_atom, test_tgt_res, test_coords, test_res_ind = crop_and_rasterize_dynamic(
             test_structures, return_coords=True
         )
-        test_dataset.append((test_in, test_tgt, test_coords))
+        test_dataset.append((test_in, test_tgt_atom, test_tgt_res, test_coords, test_res_ind))
 
-    model.eval()
-    total_gt_carbons = 0
-    total_matched_carbons = 0
+    atom_model.eval()
+    residue_model.eval()
+    total_gt_atoms = 0
+    total_matched_atoms = 0
+    total_correct_residues = 0
     total_resolved_peaks = 0
 
     print(f"\nEvaluating model over {len(test_dataset)} test crops...")
     with torch.no_grad():
-        for test_idx, (test_input, test_target, test_gt_coords) in enumerate(test_dataset):
+        for test_idx, (test_input, test_target_atom, test_target_res, test_gt_coords, test_gt_res_indices) in enumerate(test_dataset):
             test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
-            pred_density = F.relu(model(test_in_batch))
+            
+            # Predict atom density and resolve peaks
+            pred_density = F.relu(torch.sigmoid(atom_model(test_in_batch)))
             pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+
+            # Predict residue classes
+            pred_res_logits = residue_model(test_in_batch) # [1, 21, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
             pred_coords = pred_coords[0].cpu()
             pred_mask = pred_mask[0].cpu()
@@ -670,21 +766,40 @@ if __name__ == "__main__":
             num_gt_peaks = len(test_gt_coords)
 
             total_resolved_peaks += num_pred_peaks
-            total_gt_carbons += num_gt_peaks
+            total_gt_atoms += num_gt_peaks
+
+            spacing = DEFAULT_BOX_SIZE / (GRID_SIZE - 1)
 
             matched_count = 0
-            for gt_c in test_gt_coords:
+            correct_res_count = 0
+            for i, gt_c in enumerate(test_gt_coords):
+                gt_res_idx = test_gt_res_indices[i].item()
                 if num_pred_peaks > 0:
                     distances = torch.norm(pred_coords[:num_pred_peaks] - gt_c.cpu(), dim=-1)
                     min_dist, min_idx = torch.min(distances, dim=0)
                     if min_dist.item() <= MATCHING_RADIUS:
                         matched_count += 1
-            total_matched_carbons += matched_count
+                        
+                        # Query the predicted residue class at this closest peak's coordinates
+                        p_coord = pred_coords[min_idx.item()]
+                        grid_idx = torch.round(p_coord / spacing).long()
+                        grid_idx = torch.clamp(grid_idx, 0, GRID_SIZE - 1)
+                        
+                        logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
+                        pred_class = torch.argmax(logits).item()
+                        if pred_class == gt_res_idx:
+                            correct_res_count += 1
+                            
+            total_matched_atoms += matched_count
+            total_correct_residues += correct_res_count
 
-    avg_accuracy = (total_matched_carbons / total_gt_carbons) * 100 if total_gt_carbons > 0 else 0.0
+    avg_recovery = (total_matched_atoms / total_gt_atoms) * 100 if total_gt_atoms > 0 else 0.0
+    avg_classification = (total_correct_residues / total_matched_atoms) * 100 if total_matched_atoms > 0 else 0.0
     print(f"\nEvaluated over {len(test_dataset)} unseen Crambin crops.")
     print(f"Average U-Net + Peak Finder resolved peaks per crop: {total_resolved_peaks / len(test_dataset):.1f}")
-    print(f"Total Ground Truth Carbons across all crops: {total_gt_carbons}")
-    print(f"Total Matched Carbons: {total_matched_carbons}")
-    print(f"\nOverall Coordinate Recovery Accuracy: {avg_accuracy:.1f}% ({total_matched_carbons}/{total_gt_carbons} carbons resolved within {MATCHING_RADIUS} Å)")
+    print(f"Total Ground Truth Atoms across all crops: {total_gt_atoms}")
+    print(f"Total Matched Atoms: {total_matched_atoms}")
+    print(f"Total Correct Residues (of matched): {total_correct_residues}")
+    print(f"\nOverall Coordinate Recovery Accuracy: {avg_recovery:.1f}% ({total_matched_atoms}/{total_gt_atoms} atoms resolved within {MATCHING_RADIUS} Å)")
+    print(f"Overall Residue Classification Accuracy: {avg_classification:.1f}% ({total_correct_residues}/{total_matched_atoms} residue types correctly matched)")
     print("="*75)

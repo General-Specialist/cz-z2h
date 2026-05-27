@@ -16,22 +16,28 @@ import biotite.database.rcsb as rcsb
 # Seed for reproducibility
 RANDOM_SEED = 42
 
-# Standard amino acid residues to filter out water, ions, and ligands
+# Standard amino acid residues
 PROTEIN_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
 }
 
-# Stable, sorted list of standard amino acids for multi-class indexing
-AMINO_ACID_LIST = sorted(list(PROTEIN_RESIDUES))
-AMINO_ACID_MAP = {aa: idx + 1 for idx, aa in enumerate(AMINO_ACID_LIST)} # Class 0 is reserved for background
+# Standard nucleic acid residues (both RNA and DNA)
+NUCLEIC_RESIDUES = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"}
+
+# Merge all valid residues (protein + nucleic acids) to filter out water, ions, and ligands
+ALL_RESIDUES = PROTEIN_RESIDUES | NUCLEIC_RESIDUES
+
+# Stable, sorted list of standard residues for multi-class indexing
+RESIDUE_LIST = sorted(list(ALL_RESIDUES))
+RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(RESIDUE_LIST)}  # Class 0 is reserved for background
 
 # Directories and Dataset Paths
 DEFAULT_SAVE_DIR = "./pdb_data"
 TRAIN_PDB_IDS = [
     "1ubq", "1a8o", "1bpi", "1cjg", "1eyy", "1hel", "1l2y", "1pga",
     "1shg", "1csp", "1a70", "1f9g", "2igd", "1ten", "1ycr", "3gbw",
-    "1uzx", "2h3l", "1a62", "1mbo"
+    "1uzx", "2h3l", "1a62", "1mbo", "1bna", "1ehz"
 ]
 TEST_PDB_ID = "1crn"
 
@@ -115,9 +121,9 @@ def download_pdb_cif(pdb_id: str) -> str:
 
 def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
     atoms = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
-    protein_atoms = atoms[np.isin(atoms.res_name, list(PROTEIN_RESIDUES))]
-    all_coords = torch.tensor(protein_atoms.coord, dtype=torch.float32)
-    res_indices = torch.tensor([AMINO_ACID_MAP[name] for name in protein_atoms.res_name], dtype=torch.long)
+    valid_atoms = atoms[np.isin(atoms.res_name, list(ALL_RESIDUES))]
+    all_coords = torch.tensor(valid_atoms.coord, dtype=torch.float32)
+    res_indices = torch.tensor([RESIDUE_MAP[name] for name in valid_atoms.res_name], dtype=torch.long)
     return all_coords, res_indices
 
 
@@ -402,6 +408,7 @@ class DoubleConv3D(nn.Module):
 class UNet3D(nn.Module):
     """
     Fully batched and parameterized 3D U-Net Segmenter with Channel & Spatial Attention.
+    Supports Deep Supervision for training stability.
     """
     def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 32) -> None:
         super().__init__()
@@ -427,9 +434,13 @@ class UNet3D(nn.Module):
         self.conv_up2 = DoubleConv3D(F_dim * 2, F_dim)
         self.att2 = SpatialAttention3D()
 
+        # Auxiliary head for Deep Supervision at intermediate resolution (scale 16^3)
+        self.ds_conv1 = nn.Conv3d(F_dim * 2, out_channels, kernel_size=OUT_CONV_KERNEL_SIZE)
+        
+        # Main output head (scale 32^3)
         self.out_conv = nn.Conv3d(F_dim, out_channels, kernel_size=OUT_CONV_KERNEL_SIZE)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_ds: bool = False) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
         # --- Encoder ---
         x1 = self.down1(x)
         p1 = self.pool1(x1)
@@ -453,6 +464,10 @@ class UNet3D(nn.Module):
         x4 = self.att2(x4)
 
         out = self.out_conv(x4)
+        
+        if return_ds:
+            ds_out = self.ds_conv1(x3)
+            return out, ds_out
         return out
 
 
@@ -557,7 +572,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
 # ==============================================================================
 
 # Dynamic cropping function using global constants
-def crop_and_rasterize_dynamic(structures: list, return_coords: bool = False) -> tuple:
+def crop_and_rasterize_dynamic(structures: list, return_coords: bool = False, is_training: bool = False) -> tuple:
     # Pick a random structure
     all_coords, res_indices = random.choice(structures)
 
@@ -573,9 +588,17 @@ def crop_and_rasterize_dynamic(structures: list, return_coords: bool = False) ->
     # Shift coordinates to align inside the [0, DEFAULT_BOX_SIZE]^3 space
     cropped_all_centered = cropped_all - center_atom + half_box
 
+    # Sample blur sigma and noise dynamically for training robust to map qualities
+    if is_training:
+        sigma = random.uniform(0.8, 1.8)
+        noise_level = random.uniform(0.01, 0.08)
+    else:
+        sigma = INPUT_SIGMA
+        noise_level = TRAIN_NOISE_LEVEL
+
     # Input: all atoms, wider blur (simulating low-resolution cryo-EM map)
-    input_density = coords_to_density(cropped_all_centered, sigma=INPUT_SIGMA)
-    noise = torch.randn_like(input_density) * TRAIN_NOISE_LEVEL
+    input_density = coords_to_density(cropped_all_centered, sigma=sigma)
+    noise = torch.randn_like(input_density) * noise_level
     input_density = F.relu(input_density + noise)
 
     # Target 1 (Atom Detection): binary grid of all atoms (clean)
@@ -625,7 +648,7 @@ if __name__ == "__main__":
 
     # Initialize Dual U-Nets: Atom Detection & Residue Classification
     atom_model = UNet3D(in_channels=1, out_channels=1, init_features=UNET_INIT_FEATURES)
-    residue_model = UNet3D(in_channels=1, out_channels=21, init_features=UNET_INIT_FEATURES)
+    residue_model = UNet3D(in_channels=1, out_channels=len(RESIDUE_MAP) + 1, init_features=UNET_INIT_FEATURES)
 
     # Move models to device
     atom_model.to(device)
@@ -663,7 +686,7 @@ if __name__ == "__main__":
 
         for step in range(steps_per_epoch):
             # Sample crops on-the-fly from the 20 structures to get infinite diverse training inputs
-            batch_samples = [crop_and_rasterize_dynamic(train_structures) for _ in range(BATCH_SIZE)]
+            batch_samples = [crop_and_rasterize_dynamic(train_structures, is_training=True) for _ in range(BATCH_SIZE)]
 
             inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)
             atom_targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device)
@@ -674,11 +697,27 @@ if __name__ == "__main__":
 
             optimizer.zero_grad()
             
-            atom_preds = torch.sigmoid(atom_model(inputs))
-            residue_preds = residue_model(inputs)
+            # Forward pass with deep supervision enabled
+            atom_preds, atom_ds = atom_model(inputs, return_ds=True)
+            residue_preds, residue_ds = residue_model(inputs, return_ds=True)
+            
+            atom_preds = torch.sigmoid(atom_preds)
 
-            loss_atom = criterion_atom(atom_preds, atom_targets)
-            loss_residue = criterion_residue(residue_preds, residue_targets)
+            # Main losses at 32^3 scale
+            loss_atom_main = criterion_atom(atom_preds, atom_targets)
+            loss_residue_main = criterion_residue(residue_preds, residue_targets)
+
+            # Deep supervision losses at 16^3 scale
+            # Downsample target grids to match 16^3 intermediate scale
+            atom_targets_ds = F.max_pool3d(atom_targets, kernel_size=2, stride=2)
+            residue_targets_ds = F.max_pool3d(residue_targets.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()
+
+            loss_atom_ds = criterion_atom(torch.sigmoid(atom_ds), atom_targets_ds)
+            loss_residue_ds = criterion_residue(residue_ds, residue_targets_ds)
+
+            # Total joint loss (aux losses weighted by 0.5)
+            loss_atom = loss_atom_main + 0.5 * loss_atom_ds
+            loss_residue = loss_residue_main + 0.5 * loss_residue_ds
             loss = loss_atom + loss_residue
             
             loss.backward()
@@ -757,7 +796,7 @@ if __name__ == "__main__":
             pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
 
             # Predict residue classes
-            pred_res_logits = residue_model(test_in_batch) # [1, 21, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            pred_res_logits = residue_model(test_in_batch) # [1, len(RESIDUE_MAP) + 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
             pred_coords = pred_coords[0].cpu()
             pred_mask = pred_mask[0].cpu()

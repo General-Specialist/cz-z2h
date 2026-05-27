@@ -320,6 +320,9 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     random.seed(42)
 
+    # Select execution device (Apple Silicon MPS, NVIDIA CUDA, or CPU) early to accelerate pre-caching
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+
     # 1. Download structural files from RCSB PDB
     print("===========================================================================")
     print(" PREPARING PDB MOLECULAR STRUCTURAL REPOSITORY ")
@@ -361,8 +364,8 @@ if __name__ == "__main__":
                             all_atoms.append(pos)
                             if atom.element.name.strip().upper() == "C":
                                 carbon_atoms.append(pos)
-            all_coords = torch.tensor(all_atoms, dtype=torch.float32)
-            carbon_coords = torch.tensor(carbon_atoms, dtype=torch.float32)
+            all_coords = torch.tensor(all_atoms, dtype=torch.float32).to(device)
+            carbon_coords = torch.tensor(carbon_atoms, dtype=torch.float32).to(device)
             train_structures.append((all_coords, carbon_coords))
             print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_atoms)} | Carbons: {len(carbon_atoms)}")
         except Exception as e:
@@ -423,8 +426,7 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40, eta_min=1e-5)
     criterion = nn.MSELoss()
 
-    # Select execution device (Apple Silicon MPS, NVIDIA CUDA, or CPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    # Select execution device
     model.to(device)
     print(f"Running on computational device: {device}")
 

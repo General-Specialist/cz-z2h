@@ -6,20 +6,77 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gemmi
 
+# ==============================================================================
+# CONSTANTS & CONFIGURATIONS
+# ==============================================================================
+
 # Standard amino acid residues to filter out water, ions, and ligands
 PROTEIN_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
 }
 
-def download_pdb_cif(pdb_id, save_dir="./pdb_data"):
+# Directories and Dataset Paths
+DEFAULT_SAVE_DIR = "./pdb_data"
+TRAIN_PDB_IDS = ["1ubq", "1a8o", "1bpi", "1cjg", "1eyy"]
+TEST_PDB_ID = "1crn"
+
+# Volumetric & Rasterization Grid Configuration
+DEFAULT_BOX_SIZE = 16.0
+DEFAULT_GRID_SIZE = 32
+TRAIN_GRID_SIZE = 64
+
+# Gaussian Rasterization Sigmas
+DEFAULT_SIGMA = 0.8
+INPUT_SIGMA = 1.2
+TARGET_SIGMA = 0.6
+
+# Rasterization Chunking (keeps GPU memory footprint under control)
+RASTER_CHUNK_SIZE = 128
+
+# Noise Levels
+DEFAULT_NOISE_LEVEL = 0.05
+TRAIN_NOISE_LEVEL = 0.04
+
+# Carbon Target Detection Radius
+DEFAULT_RADIUS = 0.8
+
+# Training & Optimization Hyperparameters
+UNET_INIT_FEATURES = 32
+LEARNING_RATE = 0.001
+SCHEDULER_T_MAX = 60
+SCHEDULER_ETA_MIN = 1e-5
+NUM_EPOCHS = 60
+BATCH_SIZE = 8
+
+# Dataset Pre-caching Configuration
+NUM_TRAIN_CROPS = 640
+NUM_VAL_CROPS = 120
+NUM_TEST_CROPS = 20
+
+# 3D Peak Finding & Post-Processing (Mean-Shift)
+DEFAULT_PEAK_THRESHOLD = 0.30
+DEFAULT_PEAK_BANDWIDTH = 1.0
+DEFAULT_MAX_PEAKS = 128
+DEFAULT_PEAK_ITERATIONS = 5
+CLASH_LIMIT = 0.6
+
+# Coordinate Metric Evaluation
+MATCHING_RADIUS = 1.0
+
+
+# ==============================================================================
+# SECTION 1: UTILITIES, PIPELINES & DATA AUGMENTATION
+# ==============================================================================
+
+def download_pdb_cif(pdb_id, save_dir=DEFAULT_SAVE_DIR):
     os.makedirs(save_dir, exist_ok=True)
     path = f"{save_dir}/{pdb_id}.cif"
     urllib.request.urlretrieve(f"https://files.rcsb.org/download/{pdb_id}.cif", path)
     return path
 
 
-def load_and_crop_pdb(filepath: str, box_size: float = 16.0) -> tuple[torch.Tensor, torch.Tensor]:
+def load_and_crop_pdb(filepath: str, box_size: float = DEFAULT_BOX_SIZE) -> tuple[torch.Tensor, torch.Tensor]:
     structure = gemmi.read_structure(filepath)
 
     all_atoms = []
@@ -65,10 +122,10 @@ def load_and_crop_pdb(filepath: str, box_size: float = 16.0) -> tuple[torch.Tens
     return cropped_all_centered, cropped_carbon_centered
 
 
-def coords_to_density(coords: torch.Tensor, box_size: float = 16.0, grid_size: int = 32, sigma: float = 0.8) -> torch.Tensor:
+def coords_to_density(coords: torch.Tensor, box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, sigma: float = DEFAULT_SIGMA) -> torch.Tensor:
     """
     Vectorized, differentiable, and chunked 3D density rasterization.
-    Processes coordinates in chunks to limit GPU memory footprint to 134 MB and prevent CUDA OOM.
+    Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
     """
     if coords.shape[0] == 0:
         return torch.zeros((grid_size, grid_size, grid_size), device=coords.device)
@@ -84,7 +141,7 @@ def coords_to_density(coords: torch.Tensor, box_size: float = 16.0, grid_size: i
     density_flat = torch.zeros(g_flat.shape[0], device=device)
 
     # Process atoms in chunks to cap GPU memory footprint
-    chunk_size = 128
+    chunk_size = RASTER_CHUNK_SIZE
     for i in range(0, coords.shape[0], chunk_size):
         c_chunk = coords[i : i + chunk_size]
         c2_chunk = torch.sum(c_chunk ** 2, dim=-1, keepdim=True).t() # Shape: [1, chunk]
@@ -98,10 +155,10 @@ def coords_to_density(coords: torch.Tensor, box_size: float = 16.0, grid_size: i
     return density_flat.view(grid_size, grid_size, grid_size)
 
 
-def coords_to_binary_grid(coords: torch.Tensor, box_size: float = 16.0, grid_size: int = 32, radius: float = 0.8) -> torch.Tensor:
+def coords_to_binary_grid(coords: torch.Tensor, box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, radius: float = DEFAULT_RADIUS) -> torch.Tensor:
     """
     Vectorized, differentiable, and chunked 3D binary grid rasterizer.
-    Processes coordinates in chunks to limit GPU memory footprint to 134 MB and prevent CUDA OOM.
+    Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
     """
     if coords.shape[0] == 0:
         return torch.zeros((grid_size, grid_size, grid_size), device=coords.device)
@@ -117,7 +174,7 @@ def coords_to_binary_grid(coords: torch.Tensor, box_size: float = 16.0, grid_siz
     min_dists_flat = torch.full((g_flat.shape[0],), float('inf'), device=device)
 
     # Process atoms in chunks to cap GPU memory footprint
-    chunk_size = 128
+    chunk_size = RASTER_CHUNK_SIZE
     for i in range(0, coords.shape[0], chunk_size):
         c_chunk = coords[i : i + chunk_size]
         c2_chunk = torch.sum(c_chunk ** 2, dim=-1, keepdim=True).t() # Shape: [1, chunk]
@@ -146,13 +203,13 @@ def augment_batch_3d(inputs: torch.Tensor, targets: torch.Tensor) -> tuple[torch
         x = inputs[b]
         y = targets[b]
 
-        # 1. Random Flips (Reflections) - perfectly boundary-preserving
+        # 1. Random Flips (Reflections) - boundary-preserving
         for dim in (-3, -2, -1):
             if random.random() > 0.5:
                 x = torch.flip(x, dims=[dim])
                 y = torch.flip(y, dims=[dim])
 
-        # 2. Random 90-degree Rotations - perfectly boundary-preserving
+        # 2. Random 90-degree Rotations - boundary-preserving
         for plane in [(-3, -2), (-2, -1), (-3, -1)]:
             k = random.randint(0, 3)
             if k > 0:
@@ -171,7 +228,6 @@ class BCEDiceLoss(nn.Module):
         self.eps = eps
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # pred contains sigmoid probabilities
         bce = F.binary_cross_entropy(pred, target, reduction='mean')
 
         # Soft Dice Loss
@@ -185,7 +241,7 @@ class BCEDiceLoss(nn.Module):
         return bce + dice.mean()
 
 
-def generate_cryo_em_sample(filepaths: list[str], box_size: float = 16.0, grid_size: int = 32, noise_level: float = 0.05) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def generate_cryo_em_sample(filepaths: list[str], box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, noise_level: float = DEFAULT_NOISE_LEVEL) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Crops a local spatial sub-volume from a random protein and rasterizes:
     - Input: all atoms, wider blur (lower resolution), with added Gaussian noise.
@@ -195,12 +251,12 @@ def generate_cryo_em_sample(filepaths: list[str], box_size: float = 16.0, grid_s
     all_coords, carbon_coords = load_and_crop_pdb(filepath, box_size=box_size)
 
     # Input map: all atoms, wider blur (simulating low-resolution cryo-EM map)
-    input_density = coords_to_density(all_coords, box_size=box_size, grid_size=grid_size, sigma=1.2)
+    input_density = coords_to_density(all_coords, box_size=box_size, grid_size=grid_size, sigma=INPUT_SIGMA)
     noise = torch.randn_like(input_density) * noise_level
     input_density = F.relu(input_density + noise) # clamp negative densities to 0
 
     # Target map: carbons only, sharp blur (simulating ground-truth carbon positions)
-    target_density = coords_to_density(carbon_coords, box_size=box_size, grid_size=grid_size, sigma=0.6)
+    target_density = coords_to_density(carbon_coords, box_size=box_size, grid_size=grid_size, sigma=TARGET_SIGMA)
 
     return input_density, target_density, carbon_coords
 
@@ -332,7 +388,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
     Continuous 3D Mean-Shift Clustering Peak Finder natively in PyTorch on GPU.
     Seek mode centers in real continuous space with sub-voxel precision.
     """
-    def __init__(self, threshold: float = 0.30, bandwidth: float = 1.0, max_peaks: int = 128, box_size: float = 16.0, iterations: int = 5) -> None:
+    def __init__(self, threshold: float = DEFAULT_PEAK_THRESHOLD, bandwidth: float = DEFAULT_PEAK_BANDWIDTH, max_peaks: int = DEFAULT_MAX_PEAKS, box_size: float = DEFAULT_BOX_SIZE, iterations: int = DEFAULT_PEAK_ITERATIONS) -> None:
         super().__init__()
         self.threshold = threshold
         self.bandwidth = bandwidth
@@ -398,13 +454,13 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
             seeds = seeds[sorted_idx]
             final_probs = final_probs[sorted_idx]
 
-            # 5. Greedy spatial deduplication to resolve overlaps (0.6 Å clash limit)
+            # 5. Greedy spatial deduplication to resolve overlaps
             keep_mask = torch.ones(seeds.shape[0], dtype=torch.bool, device=device)
             for idx in range(seeds.shape[0]):
                 if not keep_mask[idx]:
                     continue
                 other_dists = torch.sum((seeds[idx+1:] - seeds[idx]) ** 2, dim=-1).sqrt()
-                clash_mask = other_dists < 0.6
+                clash_mask = other_dists < CLASH_LIMIT
                 keep_mask[idx+1:][clash_mask] = False
 
             seeds = seeds[keep_mask]
@@ -426,25 +482,19 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     random.seed(42)
 
-    # Select execution device (Apple Silicon MPS, NVIDIA CUDA, or CPU) early to accelerate pre-caching
+    # Select execution device (Apple Silicon MPS, NVIDIA CUDA, or CPU) early
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
-    # 1. Download structural files from RCSB PDB
     print("===========================================================================")
     print(" PREPARING PDB MOLECULAR STRUCTURAL REPOSITORY ")
     print("===========================================================================")
 
-    # Training set proteins (Ubiquitin, Rubredoxin, BPTI, Signaling Domains)
-    train_ids = ["1ubq", "1a8o", "1bpi", "1cjg", "1eyy"]
-    # Unseen testing protein (Crambin - extremely clean plant-seed lipid transfer protein)
-    test_id = "1crn"
-
-    train_files = [download_pdb_cif(pid) for pid in train_ids]
-    test_file = download_pdb_cif(test_id)
+    train_files = [download_pdb_cif(pid) for pid in TRAIN_PDB_IDS]
+    test_file = download_pdb_cif(TEST_PDB_ID)
 
     print(f"\nSuccessfully cached {len(train_files)} training structures and 1 unseen test structure.")
 
-    # 2. Load full PDB coordinates once into memory to make dynamic cropping ultra-fast
+    # Load PDB coordinates once into memory to make dynamic cropping fast
     print("\nLoading PDB structures into memory once...")
     train_structures = []
     for filepath in train_files:
@@ -468,7 +518,7 @@ if __name__ == "__main__":
         print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_atoms)} | Carbons: {len(carbon_atoms)}")
 
     # Dynamic cropping function
-    def crop_and_rasterize_dynamic(structures: list, box_size: float = 16.0, grid_size: int = 32, noise_level: float = 0.04, return_coords: bool = False) -> tuple:
+    def crop_and_rasterize_dynamic(structures: list, box_size: float = DEFAULT_BOX_SIZE, grid_size: int = DEFAULT_GRID_SIZE, noise_level: float = TRAIN_NOISE_LEVEL, return_coords: bool = False) -> tuple:
         # Pick a random structure
         all_coords, carbon_coords = random.choice(structures)
 
@@ -488,62 +538,64 @@ if __name__ == "__main__":
         cropped_carbon_centered = cropped_carbon - center_atom + half_box
 
         # Rasterize inputs and targets on the fly
-        input_density = coords_to_density(cropped_all_centered, box_size=box_size, grid_size=grid_size, sigma=1.2)
+        input_density = coords_to_density(cropped_all_centered, box_size=box_size, grid_size=grid_size, sigma=INPUT_SIGMA)
         noise = torch.randn_like(input_density) * noise_level
         input_density = F.relu(input_density + noise)
 
-        target_density = coords_to_binary_grid(cropped_carbon_centered, box_size=box_size, grid_size=grid_size, radius=0.8)
+        target_density = coords_to_binary_grid(cropped_carbon_centered, box_size=box_size, grid_size=grid_size, radius=DEFAULT_RADIUS)
 
         if return_coords:
             return input_density, target_density, cropped_carbon_centered
         return input_density, target_density
 
-    # Pre-cache training and validation datasets at startup to prevent CPU bottlenecks
-    print("\nPre-caching 640 training crops from PDB structures...")
+    # Pre-cache training and validation datasets
+    print(f"\nPre-caching {NUM_TRAIN_CROPS} training crops from PDB structures...")
     train_dataset = []
-    for idx in range(640):
-        train_input, train_target = crop_and_rasterize_dynamic(train_structures, box_size=16.0, grid_size=64, noise_level=0.04)
+    for idx in range(NUM_TRAIN_CROPS):
+        train_input, train_target = crop_and_rasterize_dynamic(train_structures, box_size=DEFAULT_BOX_SIZE, grid_size=TRAIN_GRID_SIZE, noise_level=TRAIN_NOISE_LEVEL)
         train_dataset.append((train_input, train_target))
         if (idx + 1) % 50 == 0:
             torch.cuda.empty_cache()
 
-    print("Pre-caching 120 validation crops...")
+    print(f"Pre-caching {NUM_VAL_CROPS} validation crops...")
     val_dataset = []
-    for idx in range(120):
-        val_input, val_target = crop_and_rasterize_dynamic(train_structures, box_size=16.0, grid_size=64, noise_level=0.04)
+    for idx in range(NUM_VAL_CROPS):
+        val_input, val_target = crop_and_rasterize_dynamic(train_structures, box_size=DEFAULT_BOX_SIZE, grid_size=TRAIN_GRID_SIZE, noise_level=TRAIN_NOISE_LEVEL)
         val_dataset.append((val_input, val_target))
         if (idx + 1) % 50 == 0:
             torch.cuda.empty_cache()
 
     # Initialize U-Net, optimizer, and scheduler
-    model = UNet3D(in_channels=1, out_channels=1, init_features=32)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=60, eta_min=1e-5)
+    model = UNet3D(in_channels=1, out_channels=1, init_features=UNET_INIT_FEATURES)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SCHEDULER_T_MAX, eta_min=SCHEDULER_ETA_MIN)
     criterion = BCEDiceLoss()
 
-    # Select execution device
     model.to(device)
     print(f"Running on computational device: {device}")
 
-    peak_finder = BatchedMeanShiftPeakFinder3D(threshold=0.30, bandwidth=1.0, max_peaks=128, box_size=16.0, iterations=5)
+    peak_finder = BatchedMeanShiftPeakFinder3D(
+        threshold=DEFAULT_PEAK_THRESHOLD,
+        bandwidth=DEFAULT_PEAK_BANDWIDTH,
+        max_peaks=DEFAULT_MAX_PEAKS,
+        box_size=DEFAULT_BOX_SIZE,
+        iterations=DEFAULT_PEAK_ITERATIONS
+    )
     peak_finder.to(device)
 
     print("\n" + "="*75)
     print(" RUNNING REAL PDB U-NET GENERALIZATION TRAINING ")
     print("="*75)
 
-    epochs = 60
-    batch_size = 8
-
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
         train_loss = 0.0
 
         # Shuffle indices of the pre-cached training dataset
         shuffled_indices = torch.randperm(len(train_dataset))
 
-        for i in range(0, len(train_dataset), batch_size):
-            batch_indices = shuffled_indices[i : i + batch_size]
+        for i in range(0, len(train_dataset), BATCH_SIZE):
+            batch_indices = shuffled_indices[i : i + BATCH_SIZE]
             batch_samples = [train_dataset[idx] for idx in batch_indices]
 
             inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)  # [B, 1, 32, 32, 32]
@@ -577,11 +629,11 @@ if __name__ == "__main__":
         scheduler.step()
 
         current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch:02d}/{epochs} | LR: {current_lr:.6f} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(f"Epoch {epoch:02d}/{NUM_EPOCHS} | LR: {current_lr:.6f} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
     # Evaluation on a completely unseen real protein (Crambin 1CRN)
     print("\n" + "="*75)
-    print(" EVALUATION ON UNSEEN PDB STRUCTURE: CRAMBIN (1CRN) ")
+    print(f" EVALUATION ON UNSEEN PDB STRUCTURE: CRAMBIN ({TEST_PDB_ID.upper()}) ")
     print("="*75)
 
     # Load Crambin structure coordinates once to accelerate test evaluation
@@ -603,12 +655,12 @@ if __name__ == "__main__":
     test_carbon_coords = torch.tensor(test_carbons, dtype=torch.float32).to(device)
     test_structures = [(test_all_coords, test_carbon_coords)]
 
-    # Pre-cache 20 distinct crops from Crambin to construct a robust benchmark
-    print("Pre-caching 20 unseen Crambin test crops...")
+    # Pre-cache test crops from Crambin to construct a robust benchmark
+    print(f"Pre-caching {NUM_TEST_CROPS} unseen Crambin test crops...")
     test_dataset = []
-    for _ in range(20):
+    for _ in range(NUM_TEST_CROPS):
         test_in, test_tgt, test_coords = crop_and_rasterize_dynamic(
-            test_structures, box_size=16.0, grid_size=64, noise_level=0.04, return_coords=True
+            test_structures, box_size=DEFAULT_BOX_SIZE, grid_size=TRAIN_GRID_SIZE, noise_level=TRAIN_NOISE_LEVEL, return_coords=True
         )
         test_dataset.append((test_in, test_tgt, test_coords))
 
@@ -617,7 +669,7 @@ if __name__ == "__main__":
     total_matched_carbons = 0
     total_resolved_peaks = 0
 
-    print("\nEvaluating model over 20 test crops...")
+    print(f"\nEvaluating model over {len(test_dataset)} test crops...")
     with torch.no_grad():
         for test_idx, (test_input, test_target, test_gt_coords) in enumerate(test_dataset):
             test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
@@ -638,7 +690,7 @@ if __name__ == "__main__":
                 if num_pred_peaks > 0:
                     distances = torch.norm(pred_coords[:num_pred_peaks] - gt_c.cpu(), dim=-1)
                     min_dist, min_idx = torch.min(distances, dim=0)
-                    if min_dist.item() <= 1.0:
+                    if min_dist.item() <= MATCHING_RADIUS:
                         matched_count += 1
             total_matched_carbons += matched_count
 
@@ -647,5 +699,5 @@ if __name__ == "__main__":
     print(f"Average U-Net + Peak Finder resolved peaks per crop: {total_resolved_peaks / len(test_dataset):.1f}")
     print(f"Total Ground Truth Carbons across all crops: {total_gt_carbons}")
     print(f"Total Matched Carbons: {total_matched_carbons}")
-    print(f"\nOverall Coordinate Recovery Accuracy: {avg_accuracy:.1f}% ({total_matched_carbons}/{total_gt_carbons} carbons resolved within 1.0 Å)")
+    print(f"\nOverall Coordinate Recovery Accuracy: {avg_accuracy:.1f}% ({total_matched_carbons}/{total_gt_carbons} carbons resolved within {MATCHING_RADIUS} Å)")
     print("="*75)

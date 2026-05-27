@@ -1,10 +1,13 @@
+# DO NOT EXECUTE THIS SCRIPT LOCALLY
+
 import os
 import random
-import urllib.request
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gemmi
+import biotite.structure.io.pdbx as pdbx
+import biotite.database.rcsb as rcsb
 
 # ==============================================================================
 # CONSTANTS & CONFIGURATIONS
@@ -98,35 +101,19 @@ PEAK_FINDER_EPSILON = 1e-8
 # ==============================================================================
 
 def download_pdb_cif(pdb_id: str) -> str:
-    os.makedirs(DEFAULT_SAVE_DIR, exist_ok=True)
-    path = f"{DEFAULT_SAVE_DIR}/{pdb_id}.cif"
-    urllib.request.urlretrieve(f"https://files.rcsb.org/download/{pdb_id}.cif", path)
-    return path
+    return rcsb.fetch(pdb_id, "cif", DEFAULT_SAVE_DIR)
+
+
+def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
+    atoms = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
+    protein_atoms = atoms[np.isin(atoms.res_name, list(PROTEIN_RESIDUES))]
+    all_coords = torch.tensor(protein_atoms.coord, dtype=torch.float32)
+    carbon_coords = torch.tensor(protein_atoms.coord[protein_atoms.element == "C"], dtype=torch.float32)
+    return all_coords, carbon_coords
 
 
 def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
-    structure = gemmi.read_structure(filepath)
-
-    all_atoms = []
-    carbon_atoms = []
-
-    # Flatten structure and keep only standard protein atoms
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                res_name = residue.name.strip().upper()
-                if res_name not in PROTEIN_RESIDUES:
-                    continue
-                for atom in residue:
-                    pos = [atom.pos.x, atom.pos.y, atom.pos.z]
-                    elem = atom.element.name.strip().upper()
-
-                    all_atoms.append(pos)
-                    if elem == "C":
-                        carbon_atoms.append(pos)
-
-    all_coords = torch.tensor(all_atoms, dtype=torch.float32)
-    carbon_coords = torch.tensor(carbon_atoms, dtype=torch.float32)
+    all_coords, carbon_coords = load_coords_biotite(filepath)
 
     # Select a random atom as the local crop anchor
     num_atoms = all_coords.shape[0]
@@ -136,11 +123,8 @@ def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
     # Keep coordinates falling inside the local box bounds around center_atom
     half_box = DEFAULT_BOX_SIZE / 2.0
 
-    all_mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
-    cropped_all = all_coords[all_mask]
-
-    carbon_mask = torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)
-    cropped_carbon = carbon_coords[carbon_mask]
+    cropped_all = all_coords[torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)]
+    cropped_carbon = carbon_coords[torch.all((carbon_coords >= center_atom - half_box) & (carbon_coords <= center_atom + half_box), dim=-1)]
 
     # Shift coordinates so that center_atom is centered exactly at [DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2]
     # This maps the cropped region exactly into the [0, DEFAULT_BOX_SIZE]^3 voxel space.
@@ -558,24 +542,9 @@ if __name__ == "__main__":
     print("\nLoading PDB structures into memory once...")
     train_structures = []
     for filepath in train_files:
-        structure = gemmi.read_structure(filepath)
-        all_atoms = []
-        carbon_atoms = []
-        for struct_model in structure:
-            for chain in struct_model:
-                for residue in chain:
-                    res_name = residue.name.strip().upper()
-                    if res_name not in PROTEIN_RESIDUES:
-                        continue
-                    for atom in residue:
-                        pos = [atom.pos.x, atom.pos.y, atom.pos.z]
-                        all_atoms.append(pos)
-                        if atom.element.name.strip().upper() == "C":
-                            carbon_atoms.append(pos)
-        all_coords = torch.tensor(all_atoms, dtype=torch.float32).to(device)
-        carbon_coords = torch.tensor(carbon_atoms, dtype=torch.float32).to(device)
-        train_structures.append((all_coords, carbon_coords))
-        print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_atoms)} | Carbons: {len(carbon_atoms)}")
+        all_coords, carbon_coords = load_coords_biotite(filepath)
+        train_structures.append((all_coords.to(device), carbon_coords.to(device)))
+        print(f"  Loaded {os.path.basename(filepath)} | Atoms: {len(all_coords)} | Carbons: {len(carbon_coords)}")
 
     # Pre-cache training and validation datasets
     print(f"\nPre-caching {NUM_TRAIN_CROPS} training crops from PDB structures...")
@@ -660,23 +629,8 @@ if __name__ == "__main__":
     print("="*75)
 
     # Load Crambin structure coordinates once to accelerate test evaluation
-    test_structure = gemmi.read_structure(test_file)
-    test_atoms = []
-    test_carbons = []
-    for struct_model in test_structure:
-        for chain in struct_model:
-            for residue in chain:
-                res_name = residue.name.strip().upper()
-                if res_name not in PROTEIN_RESIDUES:
-                    continue
-                for atom in residue:
-                    pos = [atom.pos.x, atom.pos.y, atom.pos.z]
-                    test_atoms.append(pos)
-                    if atom.element.name.strip().upper() == "C":
-                        test_carbons.append(pos)
-    test_all_coords = torch.tensor(test_atoms, dtype=torch.float32).to(device)
-    test_carbon_coords = torch.tensor(test_carbons, dtype=torch.float32).to(device)
-    test_structures = [(test_all_coords, test_carbon_coords)]
+    test_all_coords, test_carbon_coords = load_coords_biotite(test_file)
+    test_structures = [(test_all_coords.to(device), test_carbon_coords.to(device))]
 
     # Pre-cache test crops from Crambin to construct a robust benchmark
     print(f"Pre-caching {NUM_TEST_CROPS} unseen Crambin test crops...")

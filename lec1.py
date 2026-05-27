@@ -48,4 +48,40 @@ def cif_to_density(filepath: str, element_filter: str | None = None) -> torch.Te
     return density_map
 
 if __name__ == "__main__":
-    print(cif_to_density("data.cif"))
+    import os
+    
+    # Colab Compatibility: Auto-generate mock mmCIF file if not present
+    filename = "data.cif"
+    if not os.path.exists(filename):
+        print(f"Local mmCIF file '{filename}' not found. Creating a mock Glycine residue file...")
+        mock_cif = """data_sample
+loop_
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.auth_seq_id
+1 N  N  . GLY A 0.000 0.000 0.000 1
+2 C  CA . GLY A 1.450 0.000 0.000 1
+3 C  C  . GLY A 2.000 1.400 0.000 1
+4 O  O  . GLY A 1.350 2.400 0.000 1
+"""
+        with open(filename, "w") as f:
+            f.write(mock_cif)
+            
+    print("Rasterizing structure coordinates to 3D density grid...")
+    density = cif_to_density(filename)
+    
+    print("="*60)
+    print(" DENSITY GRID COMPUTED SUCCESSFULLY ")
+    print("="*60)
+    print(f"Density Map Shape: {list(density.shape)} (representing a 20^3 voxel grid)")
+    print(f"Maximum intensity value: {density.max().item():.4f}")
+    print(f"Minimum intensity value: {density.min().item():.4f}")
+    print(f"Sum of voxel values: {density.sum().item():.4f}")
+    print("="*60)

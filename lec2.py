@@ -123,33 +123,7 @@ def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
     return all_coords, res_indices
 
 
-def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
-    all_coords, res_indices = load_coords_biotite(filepath)
-
-    # Select a random atom as the local crop anchor
-    num_atoms = all_coords.shape[0]
-    random_idx = int(torch.randint(0, num_atoms, (1,)).item())
-    center_atom = all_coords[random_idx]
-
-    # Keep coordinates falling inside the local box bounds around center_atom
-    half_box = DEFAULT_BOX_SIZE / 2.0
-    mask = torch.all((all_coords >= center_atom - half_box) & (all_coords <= center_atom + half_box), dim=-1)
-
-    cropped_all = all_coords[mask]
-    cropped_res_indices = res_indices[mask]
-
-    # Shift coordinates so that center_atom is centered exactly at [DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2, DEFAULT_BOX_SIZE/2]
-    # This maps the cropped region exactly into the [0, DEFAULT_BOX_SIZE]^3 voxel space.
-    cropped_all_centered = cropped_all - center_atom + half_box
-
-    return cropped_all_centered, cropped_res_indices
-
-
 def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
-    """
-    Vectorized, differentiable, and chunked 3D density rasterization.
-    Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
-    """
     if coords.shape[0] == 0:
         return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=coords.device)
 
@@ -179,10 +153,6 @@ def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
-    """
-    Vectorized, differentiable, and chunked 3D binary grid rasterizer.
-    Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
-    """
     if coords.shape[0] == 0:
         return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=coords.device)
 
@@ -214,12 +184,6 @@ def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
 
 
 def coords_to_residue_grid(coords: torch.Tensor, res_indices: torch.Tensor) -> torch.Tensor:
-    """
-    Vectorized, differentiable, and chunked 3D residue grid rasterizer.
-    Processes coordinates in chunks to limit GPU memory footprint and prevent CUDA OOM.
-    Assigns each voxel the class index of the closest atom within DEFAULT_RADIUS,
-    otherwise 0 (background).
-    """
     if coords.shape[0] == 0:
         return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), dtype=torch.long, device=coords.device)
 
@@ -262,10 +226,6 @@ def augment_batch_3d_joint(
     atom_targets: torch.Tensor,
     residue_targets: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Applies boundary-preserving random 3D rotations and flips to the batch.
-    Applies the exact same transformation to the input, atom detection targets, and residue classification targets.
-    """
     B = inputs.shape[0]
     augmented_inputs = []
     augmented_atoms = []
@@ -316,38 +276,11 @@ class BCEDiceLoss(nn.Module):
         return bce + dice.mean()
 
 
-def generate_cryo_em_sample(filepaths: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Crops a local spatial sub-volume from a random protein and rasterizes:
-    - Input: all atoms, wider blur (lower resolution), with added Gaussian noise.
-    - Target 1: all atoms, sharp blur, clean.
-    - Target 2: residue class voxel grid.
-    """
-    filepath = random.choice(filepaths)
-    all_coords, res_indices = load_and_crop_pdb(filepath)
-
-    # Input map: all atoms, wider blur (simulating low-resolution cryo-EM map)
-    input_density = coords_to_density(all_coords, sigma=INPUT_SIGMA)
-    noise = torch.randn_like(input_density) * DEFAULT_NOISE_LEVEL
-    input_density = F.relu(input_density + noise) # clamp negative densities to 0
-
-    # Target 1 map: all atoms, binary grid
-    target_density = coords_to_binary_grid(all_coords)
-
-    # Target 2 map: residue class grid
-    target_residue = coords_to_residue_grid(all_coords, res_indices)
-
-    return input_density, target_density, target_residue, all_coords
-
-
 # ==============================================================================
 # SECTION 2: THE 3D U-NET ARCHITECTURE (Volumetric Segmenter)
 # ==============================================================================
 
 def get_emb(sin_inp):
-    """
-    Gets a base embedding for one dimension with sin and cos intertwined
-    """
     emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
     return torch.flatten(emb, -2, -1)
 
@@ -357,9 +290,6 @@ class PositionalEncoding3D(nn.Module):
     cached_penc: torch.Tensor | None
 
     def __init__(self, channels):
-        """
-        :param channels: The last dimension of the tensor you want to apply pos emb to.
-        """
         super().__init__()
         self.org_channels = channels
         channels = int(np.ceil(channels / 6) * 2)
@@ -371,10 +301,6 @@ class PositionalEncoding3D(nn.Module):
         self.register_buffer("cached_penc", None, persistent=False)
 
     def forward(self, tensor):
-        """
-        :param tensor: A 5d tensor of size (batch_size, x, y, z, ch)
-        :return: Positional Encoding Matrix of size (batch_size, x, y, z, ch)
-        """
         if len(tensor.shape) != 5:
             raise RuntimeError("The input tensor has to be 5d!")
 
@@ -406,11 +332,6 @@ class PositionalEncoding3D(nn.Module):
 
 
 class GeGLU(nn.Module):
-    """
-    ### GeGLU Activation
-
-    $$\text{GeGLU}(x) = (xW + b) * \text{GELU}(xV + c)$$
-    """
     def __init__(self, d_in: int, d_out: int):
         super().__init__()
         # Combined linear projections $xW + b$ and $xV + c$
@@ -425,14 +346,7 @@ class GeGLU(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """
-    ### Feed-Forward Network
-    """
     def __init__(self, d_model: int, d_mult: int = 4):
-        """
-        :param d_model: is the input embedding size
-        :param d_mult: is multiplicative factor for the hidden layer size
-        """
         super().__init__()
         self.net = nn.Sequential(
             GeGLU(d_model, d_model * d_mult),
@@ -444,9 +358,6 @@ class FeedForward(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    """
-    ### Self Attention Layer
-    """
     def __init__(
         self,
         d_model: int,
@@ -496,7 +407,6 @@ class SelfAttention(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
-    """Basic Transformer Layer"""
     def __init__(self, d_model: int, n_heads: int, d_head: int):
         super().__init__()
         self.attn1 = SelfAttention(d_model, n_heads, d_head)
@@ -511,9 +421,6 @@ class BasicTransformerBlock(nn.Module):
 
 
 class SpatialTransformerBlock3d(nn.Module):
-    """
-    ## Spatial Transformer
-    """
     def __init__(self, channels: int, n_heads: int, n_layers: int):
         super().__init__()
         num_groups = min(32, channels)
@@ -557,20 +464,11 @@ class SpatialTransformerBlock3d(nn.Module):
 
 
 class GroupNorm32(nn.GroupNorm):
-    """
-    Group normalization with float32 casting for numerical stability.
-    Matches blocks.py exactly.
-    """
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input.float()).type(input.dtype)
 
 
 def normalization(channels):
-    """
-    Helper to return GroupNorm32 with 32 groups.
-    Dynamically falls back to divisible group sizes if channels is not divisible by 32
-    (e.g., for the 1-channel raw density input layer).
-    """
     num_groups = 32
     while num_groups > 1:
         if channels % num_groups == 0:
@@ -583,10 +481,6 @@ def normalization(channels):
 
 
 class ConvBlock3d(nn.Module):
-    """
-    Modern 3D ResNet Block using Pre-Activation.
-    Matches blocks.py exactly.
-    """
     def __init__(self, channels: int, out_channels=None, kernel_size=3):
         super().__init__()
         if out_channels is None:
@@ -623,10 +517,6 @@ class ConvBlock3d(nn.Module):
 
 
 class DownSample3d(nn.Module):
-    """
-    Parametric 3D downsampling layer using a strided convolution.
-    Matches blocks.py exactly.
-    """
     def __init__(self, channels: int):
         super().__init__()
         self.op = nn.Conv3d(channels, channels, 3, stride=2, padding=1)
@@ -636,10 +526,6 @@ class DownSample3d(nn.Module):
 
 
 class UpSample3d(nn.Module):
-    """
-    Checkerboard-free 3D upsampling layer using interpolation + Conv3D.
-    Matches blocks.py exactly.
-    """
     def __init__(self, channels: int):
         super().__init__()
         self.conv = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
@@ -651,11 +537,6 @@ class UpSample3d(nn.Module):
 
 
 class UNet3D(nn.Module):
-    """
-    Modern 3D U-Net Segmenter aligned with CryoZeta's MUNet architecture.
-    Uses pre-activation residual blocks, strided conv downsampling, checkerboard-free upsampling,
-    and selectively retains attention layers and deep supervision.
-    """
     def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 32) -> None:
         super().__init__()
         F_dim = init_features
@@ -723,10 +604,6 @@ class UNet3D(nn.Module):
 # ==============================================================================
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
-    """
-    Continuous 3D Mean-Shift Clustering Peak Finder natively in PyTorch on GPU.
-    Seek mode centers in real continuous space with sub-voxel precision.
-    """
     def __init__(self) -> None:
         super().__init__()
 

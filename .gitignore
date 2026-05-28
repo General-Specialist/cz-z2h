@@ -7,3 +7,8 @@ __pycache__/
 
 # Environment/system folders
 .antigravitycli/
+
+# Reference repository and datasets
+CryoZeta/
+pdb_data/
+

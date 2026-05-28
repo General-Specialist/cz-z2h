@@ -348,91 +348,338 @@ def generate_cryo_em_sample(filepaths: list[str]) -> tuple[torch.Tensor, torch.T
 # SECTION 2: THE 3D U-NET ARCHITECTURE (Volumetric Segmenter)
 # ==============================================================================
 
-class ChannelAttention3D(nn.Module):
+def get_emb(sin_inp):
     """
-    3D Squeeze-and-Excitation Channel Attention module.
+    Gets a base embedding for one dimension with sin and cos intertwined
     """
-    def __init__(self, channels: int) -> None:
+    emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
+    return torch.flatten(emb, -2, -1)
+
+
+class PositionalEncoding3D(nn.Module):
+    def __init__(self, channels):
+        """
+        :param channels: The last dimension of the tensor you want to apply pos emb to.
+        """
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Flatten(),
-            nn.Linear(channels, channels // CHANNEL_ATTN_REDUCTION),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // CHANNEL_ATTN_REDUCTION, channels),
-            nn.Sigmoid()
+        self.org_channels = channels
+        channels = int(np.ceil(channels / 6) * 2)
+        if channels % 2:
+            channels += 1
+        self.channels = channels
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2).float() / channels))
+        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("cached_penc", None, persistent=False)
+
+    def forward(self, tensor):
+        """
+        :param tensor: A 5d tensor of size (batch_size, x, y, z, ch)
+        :return: Positional Encoding Matrix of size (batch_size, x, y, z, ch)
+        """
+        if len(tensor.shape) != 5:
+            raise RuntimeError("The input tensor has to be 5d!")
+
+        if self.cached_penc is not None and self.cached_penc.shape == tensor.shape:
+            return self.cached_penc
+
+        self.cached_penc = None
+        batch_size, x, y, z, orig_ch = tensor.shape
+        pos_x = torch.arange(x, device=tensor.device, dtype=self.inv_freq.dtype)
+        pos_y = torch.arange(y, device=tensor.device, dtype=self.inv_freq.dtype)
+        pos_z = torch.arange(z, device=tensor.device, dtype=self.inv_freq.dtype)
+        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
+        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
+        sin_inp_z = torch.einsum("i,j->ij", pos_z, self.inv_freq)
+        emb_x = get_emb(sin_inp_x).unsqueeze(1).unsqueeze(1)
+        emb_y = get_emb(sin_inp_y).unsqueeze(1)
+        emb_z = get_emb(sin_inp_z)
+        emb = torch.zeros(
+            (x, y, z, self.channels * 3),
+            device=tensor.device,
+            dtype=tensor.dtype,
         )
+        emb[:, :, :, : self.channels] = emb_x
+        emb[:, :, :, self.channels : 2 * self.channels] = emb_y
+        emb[:, :, :, 2 * self.channels :] = emb_z
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C = x.shape[0], x.shape[1]
-        weights = self.fc(x).view(B, C, 1, 1, 1)
-        return x * weights
+        self.cached_penc = emb[None, :, :, :, :orig_ch].repeat(batch_size, 1, 1, 1, 1)
+        return self.cached_penc
 
 
-class SpatialAttention3D(nn.Module):
+class GeGLU(nn.Module):
     """
-    3D Spatial Attention module using average and max pooling descriptors.
+    ### GeGLU Activation
+
+    $$\text{GeGLU}(x) = (xW + b) * \text{GELU}(xV + c)$$
     """
-    def __init__(self) -> None:
+    def __init__(self, d_in: int, d_out: int):
         super().__init__()
-        self.conv = nn.Conv3d(2, 1, kernel_size=SPATIAL_ATTN_KERNEL_SIZE, padding=SPATIAL_ATTN_PADDING)
+        # Combined linear projections $xW + b$ and $xV + c$
+        self.proj = nn.Linear(d_in, d_out * 2)
+        self.gelu = nn.GELU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        mean_out = torch.mean(x, dim=1, keepdim=True)
-        combined = torch.cat([max_out, mean_out], dim=1)
-        weights = torch.sigmoid(self.conv(combined))
-        return x * weights
+    def forward(self, x: torch.Tensor):
+        # Get $xW + b$ and $xV + c$
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        # $\text{GeGLU}(x) = (xW + b) * \text{GELU}(xV + c)$
+        return x * self.gelu(gate)
 
 
-class DoubleConv3D(nn.Module):
+class FeedForward(nn.Module):
     """
-    Fundamental 3D building block: (Conv3D -> BatchNorm3D -> ReLU) * 2.
-    Processes volumetric feature maps while maintaining spatial dimensions.
+    ### Feed-Forward Network
     """
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(self, d_model: int, d_mult: int = 4):
+        """
+        :param d_model: is the input embedding size
+        :param d_mult: is multiplicative factor for the hidden layer size
+        """
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=CONV_KERNEL_SIZE, padding=CONV_PADDING),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(out_channels, out_channels, kernel_size=CONV_KERNEL_SIZE, padding=CONV_PADDING),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True)
+            GeGLU(d_model, d_model * d_mult),
+            nn.Linear(d_model * d_mult, d_model),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         return self.net(x)
+
+
+class SelfAttention(nn.Module):
+    """
+    ### Self Attention Layer
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dim_head: int,
+        use_flash_attention: bool = True,
+    ):
+        super().__init__()
+        self.n_heads = num_heads
+        self.d_head = dim_head
+        d_attn = dim_head * num_heads
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_attn, bias=False)
+        self.o_proj = nn.Linear(d_attn, d_model)
+
+        if use_flash_attention:
+            try:
+                from flash_attn import flash_attn_func
+                self.flash = True
+                self._flash_attention = flash_attn_func
+            except ImportError:
+                self.flash = False
+        else:
+            self.flash = False
+
+    def forward(self, x: torch.Tensor):
+        batch_size, seq_len, _ = x.size()
+
+        # Get query, key and value vectors
+        qkv = self.qkv_proj(x)  # Shape: (batch_size, seq_len, 3*d_attn)
+        q, k, v = qkv.chunk(3, dim=-1)  # Shape: (batch_size, seq_len, d_attn)
+
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_head)
+        k = k.view(batch_size, seq_len, self.n_heads, self.d_head)
+        v = v.view(batch_size, seq_len, self.n_heads, self.d_head)
+
+        if self.flash:
+            output = self._flash_attention(q, k, v)
+        else:
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            output = F.scaled_dot_product_attention(q, k, v)
+            output = output.permute(0, 2, 1, 3)
+
+        return self.o_proj(output.reshape(batch_size, seq_len, -1))
+
+
+class BasicTransformerBlock(nn.Module):
+    """Basic Transformer Layer"""
+    def __init__(self, d_model: int, n_heads: int, d_head: int):
+        super().__init__()
+        self.attn1 = SelfAttention(d_model, n_heads, d_head)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor):
+        x = self.attn1(self.norm1(x)) + x
+        x = self.ff(self.norm2(x)) + x
+        return x
+
+
+class SpatialTransformerBlock3d(nn.Module):
+    """
+    ## Spatial Transformer
+    """
+    def __init__(self, channels: int, n_heads: int, n_layers: int):
+        super().__init__()
+        num_groups = min(32, channels)
+        if channels % num_groups != 0:
+            num_groups = 1
+        self.norm = torch.nn.GroupNorm(
+            num_groups=num_groups, num_channels=channels, eps=1e-6, affine=True
+        )
+        self.proj_in = nn.Conv3d(channels, channels, kernel_size=1, stride=1, padding=0)
+        self.positional_encoding = PositionalEncoding3D(channels)
+
+        # Transformer layers
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock(channels, n_heads, channels // n_heads)
+                for _ in range(n_layers)
+            ]
+        )
+        self.proj_out = nn.Conv3d(
+            channels, channels, kernel_size=1, stride=1, padding=0
+        )
+
+    def forward(self, x: torch.Tensor):
+        b, c, h, w, d = x.shape
+        x_in = x
+        x = self.norm(x)
+        x = self.proj_in(x)
+        x = x.permute(0, 2, 3, 4, 1)
+
+        pos_emb = self.positional_encoding(x)
+        x += pos_emb
+
+        x = x.view(b, h * w * d, c)
+
+        for block in self.transformer_blocks:
+            x = block(x)
+
+        x = x.view(b, h, w, d, c).permute(0, 4, 1, 2, 3)
+        x = self.proj_out(x)
+        return x + x_in
+
+
+class GroupNorm32(nn.GroupNorm):
+    """
+    Group normalization with float32 casting for numerical stability.
+    Matches blocks.py exactly.
+    """
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+
+
+def normalization(channels):
+    """
+    Helper to return GroupNorm32 with 32 groups.
+    Dynamically falls back to divisible group sizes if channels is not divisible by 32
+    (e.g., for the 1-channel raw density input layer).
+    """
+    num_groups = 32
+    while num_groups > 1:
+        if channels % num_groups == 0:
+            break
+        num_groups //= 2
+    if num_groups == 0 or channels % num_groups != 0:
+        num_groups = 1
+    return GroupNorm32(num_groups, channels)
+
+
+
+class ConvBlock3d(nn.Module):
+    """
+    Modern 3D ResNet Block using Pre-Activation.
+    Matches blocks.py exactly.
+    """
+    def __init__(self, channels: int, out_channels=None, kernel_size=3):
+        super().__init__()
+        if out_channels is None:
+            out_channels = channels
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            nn.Conv3d(channels, out_channels, 3, padding=1),
+        )
+
+        self.out_layers = nn.Sequential(
+            normalization(out_channels),
+            nn.SiLU(),
+            nn.Dropout(0.0),
+            nn.Conv3d(
+                out_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=(kernel_size - 1) // 2,
+                groups=out_channels,
+            ),
+        )
+
+        if out_channels == channels:
+            self.skip_connection = nn.Identity()
+        else:
+            self.skip_connection = nn.Conv3d(channels, out_channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.in_layers(x)
+        h = self.out_layers(h)
+        return self.skip_connection(x) + h
+
+
+class DownSample3d(nn.Module):
+    """
+    Parametric 3D downsampling layer using a strided convolution.
+    Matches blocks.py exactly.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.op = nn.Conv3d(channels, channels, 3, stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.op(x)
+
+
+class UpSample3d(nn.Module):
+    """
+    Checkerboard-free 3D upsampling layer using interpolation + Conv3D.
+    Matches blocks.py exactly.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.scale_factor = 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode="nearest")
+        return self.conv(x)
 
 
 class UNet3D(nn.Module):
     """
-    Fully batched and parameterized 3D U-Net Segmenter with Channel & Spatial Attention.
-    Supports Deep Supervision for training stability.
+    Modern 3D U-Net Segmenter aligned with CryoZeta's MUNet architecture.
+    Uses pre-activation residual blocks, strided conv downsampling, checkerboard-free upsampling,
+    and selectively retains attention layers and deep supervision.
     """
     def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 32) -> None:
         super().__init__()
         F_dim = init_features
 
         # --- Encoder (Downsampling Path) ---
-        self.down1 = DoubleConv3D(in_channels, F_dim)
-        self.pool1 = nn.MaxPool3d(kernel_size=POOL_KERNEL_SIZE, stride=POOL_STRIDE)
+        self.down1 = ConvBlock3d(in_channels, F_dim)
+        self.pool1 = DownSample3d(F_dim)
 
-        self.down2 = DoubleConv3D(F_dim, F_dim * 2)
-        self.pool2 = nn.MaxPool3d(kernel_size=POOL_KERNEL_SIZE, stride=POOL_STRIDE)
+        self.down2 = ConvBlock3d(F_dim, F_dim * 2)
+        self.pool2 = DownSample3d(F_dim * 2)
 
         # --- Bottleneck ---
-        self.bottleneck = DoubleConv3D(F_dim * 2, F_dim * 4)
-        self.bottleneck_att = ChannelAttention3D(F_dim * 4)
+        self.bottleneck = ConvBlock3d(F_dim * 2, F_dim * 4)
+        self.bottleneck_att = SpatialTransformerBlock3d(F_dim * 4, n_heads=2, n_layers=1)
 
         # --- Decoder (Upsampling Path) ---
-        self.up1 = nn.ConvTranspose3d(F_dim * 4, F_dim * 2, kernel_size=TRANSPOSE_KERNEL_SIZE, stride=TRANSPOSE_STRIDE)
-        self.conv_up1 = DoubleConv3D(F_dim * 4, F_dim * 2)
-        self.att1 = SpatialAttention3D()
+        self.up1 = UpSample3d(F_dim * 4)
+        self.conv_up1 = ConvBlock3d(F_dim * 6, F_dim * 2) # 4 (upsampled) + 2 (skip connection)
+        self.att1 = SpatialTransformerBlock3d(F_dim * 2, n_heads=2, n_layers=1)
 
-        self.up2 = nn.ConvTranspose3d(F_dim * 2, F_dim, kernel_size=TRANSPOSE_KERNEL_SIZE, stride=TRANSPOSE_STRIDE)
-        self.conv_up2 = DoubleConv3D(F_dim * 2, F_dim)
-        self.att2 = SpatialAttention3D()
+        self.up2 = UpSample3d(F_dim * 2)
+        self.conv_up2 = ConvBlock3d(F_dim * 3, F_dim) # 2 (upsampled) + 1 (skip connection)
+        self.att2 = SpatialTransformerBlock3d(F_dim, n_heads=2, n_layers=1)
 
         # Auxiliary head for Deep Supervision at intermediate resolution (scale 16^3)
         self.ds_conv1 = nn.Conv3d(F_dim * 2, out_channels, kernel_size=OUT_CONV_KERNEL_SIZE)
@@ -469,6 +716,7 @@ class UNet3D(nn.Module):
             ds_out = self.ds_conv1(x3)
             return out, ds_out
         return out
+
 
 
 # ==============================================================================
@@ -616,8 +864,8 @@ if __name__ == "__main__":
     torch.manual_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
 
-    # Select execution device (Apple Silicon MPS, NVIDIA CUDA, or CPU) early
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    # Select execution device (NVIDIA CUDA or CPU) early. Script should never run locally.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("===========================================================================")
     print(" PREPARING PDB MOLECULAR STRUCTURAL REPOSITORY ")

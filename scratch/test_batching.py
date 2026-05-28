@@ -5,7 +5,7 @@ import os
 # Include current directory in path
 sys.path.append(os.path.abspath(os.path.dirname(__file__) + "/.."))
 
-from lec2 import UNet3D, BatchedPeakFinder3D
+from lec2 import UNet3D, BatchedMeanShiftPeakFinder3D, DEFAULT_MAX_PEAKS
 
 def test_reusable_pipeline():
     print("="*60)
@@ -33,10 +33,10 @@ def test_reusable_pipeline():
     assert output.shape == mock_input.shape, "Error: UNet3D output shape mismatch!"
     print("    -> UNet3D shape assertion passed!")
 
-    # 2. Test BatchedPeakFinder3D extraction and shape correctness
-    print("\n[2] Testing BatchedPeakFinder3D coordinate extraction...")
-    max_peaks = 12
-    peak_finder = BatchedPeakFinder3D(threshold=0.1, kernel_size=3, max_peaks=max_peaks, box_size=10.0)
+    # 2. Test BatchedMeanShiftPeakFinder3D extraction and shape correctness
+    print("\n[2] Testing BatchedMeanShiftPeakFinder3D coordinate extraction...")
+    max_peaks = DEFAULT_MAX_PEAKS
+    peak_finder = BatchedMeanShiftPeakFinder3D()
     
     # Setup some deterministic high peaks in mock_input
     # Batch 0: 2 high peaks

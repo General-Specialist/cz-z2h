@@ -9,8 +9,6 @@ from typing import Any
 import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 
-from flash_attn import flash_attn_func
-
 # ==============================================================================
 # CONSTANTS & CONFIGURATIONS
 # ==============================================================================
@@ -348,7 +346,6 @@ class SelfAttention(nn.Module):
         d_model: int,
         num_heads: int,
         dim_head: int,
-        use_flash_attention: bool = True,
     ):
         super().__init__()
         self.n_heads = num_heads
@@ -357,10 +354,6 @@ class SelfAttention(nn.Module):
 
         self.qkv_proj = nn.Linear(d_model, 3 * d_attn, bias=False)
         self.o_proj = nn.Linear(d_attn, d_model)
-
-        self.flash = use_flash_attention
-        if self.flash:
-            self._flash_attention = flash_attn_func
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, _ = x.size()
@@ -373,14 +366,11 @@ class SelfAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.n_heads, self.d_head)
         v = v.view(batch_size, seq_len, self.n_heads, self.d_head)
 
-        if self.flash:
-            output = self._flash_attention(q, k, v)
-        else:
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            output = F.scaled_dot_product_attention(q, k, v)
-            output = output.permute(0, 2, 1, 3)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        output = F.scaled_dot_product_attention(q, k, v)
+        output = output.permute(0, 2, 1, 3)
 
         return self.o_proj(output.reshape(batch_size, seq_len, -1))
 

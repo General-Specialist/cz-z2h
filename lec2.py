@@ -16,21 +16,12 @@ import biotite.database.rcsb as rcsb
 # Seed for reproducibility
 RANDOM_SEED = 42
 
-# Standard amino acid residues
 PROTEIN_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
 }
-
-# Standard nucleic acid residues (both RNA and DNA)
-NUCLEIC_RESIDUES = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"}
-
-# Merge all valid residues (protein + nucleic acids) to filter out water, ions, and ligands
-ALL_RESIDUES = PROTEIN_RESIDUES | NUCLEIC_RESIDUES
-
-# Stable, sorted list of standard residues for multi-class indexing
-RESIDUE_LIST = sorted(list(ALL_RESIDUES))
-RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(RESIDUE_LIST)}  # Class 0 is reserved for background
+NUCLEIC_RESIDUES = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"} #D stands for deoxy
+RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(sorted(list(PROTEIN_RESIDUES | NUCLEIC_RESIDUES)))}  # Class 0 is reserved for background
 
 # Directories and Dataset Paths
 DEFAULT_SAVE_DIR = "./pdb_data"
@@ -683,7 +674,7 @@ class UNet3D(nn.Module):
 
         # Auxiliary head for Deep Supervision at intermediate resolution (scale 16^3)
         self.ds_conv1 = nn.Conv3d(F_dim * 2, out_channels, kernel_size=OUT_CONV_KERNEL_SIZE)
-        
+
         # Main output head (scale 32^3)
         self.out_conv = nn.Conv3d(F_dim, out_channels, kernel_size=OUT_CONV_KERNEL_SIZE)
 
@@ -711,7 +702,7 @@ class UNet3D(nn.Module):
         x4 = self.att2(x4)
 
         out = self.out_conv(x4)
-        
+
         if return_ds:
             ds_out = self.ds_conv1(x3)
             return out, ds_out
@@ -944,11 +935,11 @@ if __name__ == "__main__":
             inputs, atom_targets, residue_targets = augment_batch_3d_joint(inputs, atom_targets, residue_targets)
 
             optimizer.zero_grad()
-            
+
             # Forward pass with deep supervision enabled
             atom_preds, atom_ds = atom_model(inputs, return_ds=True)
             residue_preds, residue_ds = residue_model(inputs, return_ds=True)
-            
+
             atom_preds = torch.sigmoid(atom_preds)
 
             # Main losses at 32^3 scale
@@ -967,7 +958,7 @@ if __name__ == "__main__":
             loss_atom = loss_atom_main + 0.5 * loss_atom_ds
             loss_residue = loss_residue_main + 0.5 * loss_residue_ds
             loss = loss_atom + loss_residue
-            
+
             loss.backward()
             optimizer.step()
 
@@ -984,28 +975,28 @@ if __name__ == "__main__":
                 val_input_tensor = val_input.unsqueeze(0).unsqueeze(0).to(device)
                 val_target_atom_tensor = val_target_atom.unsqueeze(0).unsqueeze(0).to(device)
                 val_target_res_tensor = val_target_res.unsqueeze(0).to(device)
-                
+
                 # Forward pass with deep supervision enabled
                 val_atom_pred, val_atom_ds = atom_model(val_input_tensor, return_ds=True)
                 val_res_pred, val_res_ds = residue_model(val_input_tensor, return_ds=True)
-                
+
                 val_atom_pred = torch.sigmoid(val_atom_pred)
-                
+
                 # Main losses at 32^3 scale
                 loss_atom_main = criterion_atom(val_atom_pred, val_target_atom_tensor)
                 loss_residue_main = criterion_residue(val_res_pred, val_target_res_tensor)
-                
+
                 # Deep supervision losses at 16^3 scale
                 val_atom_targets_ds = F.max_pool3d(val_target_atom_tensor, kernel_size=2, stride=2)
                 val_residue_targets_ds = F.max_pool3d(val_target_res_tensor.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()
-                
+
                 loss_atom_ds = criterion_atom(torch.sigmoid(val_atom_ds), val_atom_targets_ds)
                 loss_residue_ds = criterion_residue(val_res_ds, val_residue_targets_ds)
-                
+
                 # Joint validation loss matching the training weights
                 loss_atom = loss_atom_main + 0.5 * loss_atom_ds
                 loss_residue = loss_residue_main + 0.5 * loss_residue_ds
-                
+
                 val_loss += (loss_atom + loss_residue).item()
             val_loss /= len(val_dataset)
 
@@ -1053,7 +1044,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         for test_idx, (test_input, test_target_atom, test_target_res, test_gt_coords, test_gt_res_indices) in enumerate(test_dataset):
             test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
-            
+
             # Predict atom density and resolve peaks
             pred_density = F.relu(torch.sigmoid(atom_model(test_in_batch)))
             pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
@@ -1081,18 +1072,18 @@ if __name__ == "__main__":
                     min_dist, min_idx = torch.min(distances, dim=0)
                     if min_dist.item() <= MATCHING_RADIUS:
                         matched_count += 1
-                        
+
                         # Query the predicted residue class at this closest peak's coordinates
                         p_coord = pred_coords[min_idx.item()]
                         grid_idx = torch.round(p_coord / spacing).long()
                         grid_idx = torch.clamp(grid_idx, 0, GRID_SIZE - 1)
-                        
+
                         logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
                         # Slice off class 0 (background) since we are querying at an active atom peak coordinate
                         pred_class = torch.argmax(logits[1:]).item() + 1
                         if pred_class == gt_res_idx:
                             correct_res_count += 1
-                            
+
             total_matched_atoms += matched_count
             total_correct_residues += correct_res_count
 

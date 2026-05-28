@@ -640,7 +640,7 @@ if __name__ == "__main__":
     print(f"\nPre-caching {NUM_VAL_CROPS} validation crops...")
     val_dataset = []
     for idx in range(NUM_VAL_CROPS):
-        val_input, val_target_atom, val_target_res = crop_and_rasterize_dynamic(train_structures)
+        val_input, val_target_atom, val_target_res = crop_and_rasterize_dynamic(train_structures, is_training=True)
         val_dataset.append((val_input, val_target_atom, val_target_res))
         if (idx + 1) % 50 == 0:
             if torch.cuda.is_available():
@@ -737,11 +737,26 @@ if __name__ == "__main__":
                 val_target_atom_tensor = val_target_atom.unsqueeze(0).unsqueeze(0).to(device)
                 val_target_res_tensor = val_target_res.unsqueeze(0).to(device)
                 
-                val_atom_pred = torch.sigmoid(atom_model(val_input_tensor))
-                val_res_pred = residue_model(val_input_tensor)
+                # Forward pass with deep supervision enabled
+                val_atom_pred, val_atom_ds = atom_model(val_input_tensor, return_ds=True)
+                val_res_pred, val_res_ds = residue_model(val_input_tensor, return_ds=True)
                 
-                loss_atom = criterion_atom(val_atom_pred, val_target_atom_tensor)
-                loss_residue = criterion_residue(val_res_pred, val_target_res_tensor)
+                val_atom_pred = torch.sigmoid(val_atom_pred)
+                
+                # Main losses at 32^3 scale
+                loss_atom_main = criterion_atom(val_atom_pred, val_target_atom_tensor)
+                loss_residue_main = criterion_residue(val_res_pred, val_target_res_tensor)
+                
+                # Deep supervision losses at 16^3 scale
+                val_atom_targets_ds = F.max_pool3d(val_target_atom_tensor, kernel_size=2, stride=2)
+                val_residue_targets_ds = F.max_pool3d(val_target_res_tensor.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()
+                
+                loss_atom_ds = criterion_atom(torch.sigmoid(val_atom_ds), val_atom_targets_ds)
+                loss_residue_ds = criterion_residue(val_res_ds, val_residue_targets_ds)
+                
+                # Joint validation loss matching the training weights
+                loss_atom = loss_atom_main + 0.5 * loss_atom_ds
+                loss_residue = loss_residue_main + 0.5 * loss_residue_ds
                 
                 val_loss += (loss_atom + loss_residue).item()
             val_loss /= len(val_dataset)
@@ -775,7 +790,7 @@ if __name__ == "__main__":
     test_dataset = []
     for _ in range(NUM_TEST_CROPS):
         test_in, test_tgt_atom, test_tgt_res, test_coords, test_res_ind = crop_and_rasterize_dynamic(
-            test_structures, return_coords=True
+            test_structures, return_coords=True, is_training=True
         )
         test_dataset.append((test_in, test_tgt_atom, test_tgt_res, test_coords, test_res_ind))
 

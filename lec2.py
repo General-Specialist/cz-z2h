@@ -823,7 +823,7 @@ if __name__ == "__main__":
         residue_model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for val_input, val_target_atom, val_target_res in val_dataset:
+            for idx, (val_input, val_target_atom, val_target_res) in enumerate(val_dataset):
                 val_input_tensor = val_input.unsqueeze(0).unsqueeze(0).to(device)
                 val_target_atom_tensor = val_target_atom.unsqueeze(0).unsqueeze(0).to(device)
                 val_target_res_tensor = val_target_res.unsqueeze(0).to(device)
@@ -855,7 +855,7 @@ if __name__ == "__main__":
         scheduler.step()
 
         current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch:02d}/{NUM_EPOCHS} | LR: {current_lr:.6f} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        print(f"Epoch {epoch:02d}/{NUM_EPOCHS} | LR: {current_lr:.6f} | Train Loss: {train_loss:.3f} | Val Loss: {val_loss:.3f}")
 
         # Check for early stopping based on validation loss
         if val_loss < best_val_loss:

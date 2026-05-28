@@ -1,7 +1,6 @@
-# DO NOT EXECUTE THIS SCRIPT LOCALLY FOR ANY REASON WHATSOEVER
-
 import os
 import random
+import itertools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,6 +8,8 @@ import torch.nn.functional as F
 from typing import Any
 import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
+
+from flash_attn import flash_attn_func
 
 # ==============================================================================
 # CONSTANTS & CONFIGURATIONS
@@ -124,9 +125,6 @@ def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
-    if coords.shape[0] == 0:
-        return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=coords.device)
-
     device = coords.device
     # Generate the 3D grid ticks
     ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
@@ -153,9 +151,6 @@ def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
-    if coords.shape[0] == 0:
-        return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=coords.device)
-
     device = coords.device
     # Generate the 3D grid ticks
     ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
@@ -184,9 +179,6 @@ def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
 
 
 def coords_to_residue_grid(coords: torch.Tensor, res_indices: torch.Tensor) -> torch.Tensor:
-    if coords.shape[0] == 0:
-        return torch.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE), dtype=torch.long, device=coords.device)
-
     device = coords.device
     # Generate the 3D grid ticks
     ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
@@ -291,17 +283,12 @@ class PositionalEncoding3D(nn.Module):
 
     def __init__(self, channels):
         super().__init__()
-        if channels % 6 != 0:
-            raise ValueError(f"Total channels ({channels}) must be divisible by 6 (even pairs for X, Y, Z).")
-        self.channels = channels // 3
+        self.channels = (channels + 5) // 6 * 2
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.channels, 2).float() / self.channels))
         self.register_buffer("inv_freq", inv_freq)
         self.register_buffer("cached_penc", None, persistent=False)
 
     def forward(self, tensor):
-        if len(tensor.shape) != 5:
-            raise RuntimeError("The input tensor has to be 5d!")
-
         if self.cached_penc is not None and self.cached_penc.shape == tensor.shape:
             return self.cached_penc
 
@@ -371,15 +358,9 @@ class SelfAttention(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_attn, bias=False)
         self.o_proj = nn.Linear(d_attn, d_model)
 
-        if use_flash_attention:
-            try:
-                from flash_attn import flash_attn_func  # type: ignore
-                self.flash = True
-                self._flash_attention = flash_attn_func
-            except ImportError:
-                self.flash = False
-        else:
-            self.flash = False
+        self.flash = use_flash_attention
+        if self.flash:
+            self._flash_attention = flash_attn_func
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, _ = x.size()
@@ -681,10 +662,9 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
             final_probs = final_probs[keep_mask]
 
             num_to_copy = min(seeds.shape[0], M)
-            if num_to_copy > 0:
-                out_coords[b, :num_to_copy] = seeds[:num_to_copy]
-                out_values[b, :num_to_copy] = final_probs[:num_to_copy]
-                out_mask[b, :num_to_copy] = True
+            out_coords[b, :num_to_copy] = seeds[:num_to_copy]
+            out_values[b, :num_to_copy] = final_probs[:num_to_copy]
+            out_mask[b, :num_to_copy] = True
 
         return out_coords, out_values, out_mask
 
@@ -777,7 +757,6 @@ if __name__ == "__main__":
     residue_model.to(device)
 
     # Set up joint optimizer for both models
-    import itertools
     optimizer = torch.optim.Adam(
         itertools.chain(atom_model.parameters(), residue_model.parameters()),
         lr=LEARNING_RATE

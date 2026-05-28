@@ -1,3 +1,4 @@
+import os
 import torch
 import gemmi
 
@@ -18,8 +19,6 @@ def cif_to_density(filepath: str, element_filter: str | None = None) -> torch.Te
 
     if element_filter is not None:
         filtered_atoms: list[gemmi.Atom] = [a for a in atoms if a.element.name.strip().upper() == element_filter.strip().upper()]
-        if not filtered_atoms:
-            return torch.zeros((20, 20, 20))
         coords = [[a.pos.x, a.pos.y, a.pos.z] for a in filtered_atoms]
         coordinates = torch.tensor(coords, dtype=torch.float32)
 
@@ -48,7 +47,6 @@ def cif_to_density(filepath: str, element_filter: str | None = None) -> torch.Te
     return density_map
 
 if __name__ == "__main__":
-    import os
     
     # Colab Compatibility: Auto-generate mock mmCIF file if not present
     filename = "data.cif"

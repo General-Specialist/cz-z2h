@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Any
 import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 
@@ -21,7 +22,8 @@ PROTEIN_RESIDUES = {
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
 }
 NUCLEIC_RESIDUES = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"} #D stands for deoxy
-RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(sorted(list(PROTEIN_RESIDUES | NUCLEIC_RESIDUES)))}  # Class 0 is reserved for background
+ALL_RESIDUES = PROTEIN_RESIDUES | NUCLEIC_RESIDUES
+RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(sorted(list(ALL_RESIDUES)))}  # Class 0 is reserved for background
 
 # Directories and Dataset Paths
 DEFAULT_SAVE_DIR = "./pdb_data"
@@ -107,12 +109,15 @@ PEAK_FINDER_EPSILON = 1e-8
 # ==============================================================================
 
 def download_pdb_cif(pdb_id: str) -> str:
-    return rcsb.fetch(pdb_id, "cif", DEFAULT_SAVE_DIR)
+    path = rcsb.fetch(pdb_id, "cif", DEFAULT_SAVE_DIR)
+    if isinstance(path, list):
+        return str(path[0])
+    return str(path)
 
 
 def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
-    atoms = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
-    valid_atoms = atoms[np.isin(atoms.res_name, list(ALL_RESIDUES))]
+    atoms: Any = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
+    valid_atoms: Any = atoms[np.isin(atoms.res_name, list(ALL_RESIDUES))]
     all_coords = torch.tensor(valid_atoms.coord, dtype=torch.float32)
     res_indices = torch.tensor([RESIDUE_MAP[name] for name in valid_atoms.res_name], dtype=torch.long)
     return all_coords, res_indices
@@ -123,7 +128,7 @@ def load_and_crop_pdb(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
 
     # Select a random atom as the local crop anchor
     num_atoms = all_coords.shape[0]
-    random_idx = torch.randint(0, num_atoms, (1,)).item()
+    random_idx = int(torch.randint(0, num_atoms, (1,)).item())
     center_atom = all_coords[random_idx]
 
     # Keep coordinates falling inside the local box bounds around center_atom
@@ -348,6 +353,9 @@ def get_emb(sin_inp):
 
 
 class PositionalEncoding3D(nn.Module):
+    inv_freq: torch.Tensor
+    cached_penc: torch.Tensor | None
+
     def __init__(self, channels):
         """
         :param channels: The last dimension of the tensor you want to apply pos emb to.
@@ -456,7 +464,7 @@ class SelfAttention(nn.Module):
 
         if use_flash_attention:
             try:
-                from flash_attn import flash_attn_func
+                from flash_attn import flash_attn_func  # type: ignore
                 self.flash = True
                 self._flash_attention = flash_attn_func
             except ImportError:
@@ -553,8 +561,8 @@ class GroupNorm32(nn.GroupNorm):
     Group normalization with float32 casting for numerical stability.
     Matches blocks.py exactly.
     """
-    def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return super().forward(input.float()).type(input.dtype)
 
 
 def normalization(channels):

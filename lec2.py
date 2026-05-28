@@ -790,7 +790,7 @@ if __name__ == "__main__":
     test_dataset = []
     for _ in range(NUM_TEST_CROPS):
         test_in, test_tgt_atom, test_tgt_res, test_coords, test_res_ind = crop_and_rasterize_dynamic(
-            test_structures, return_coords=True, is_training=True
+            test_structures, return_coords=True, is_training=False
         )
         test_dataset.append((test_in, test_tgt_atom, test_tgt_res, test_coords, test_res_ind))
 
@@ -840,7 +840,8 @@ if __name__ == "__main__":
                         grid_idx = torch.clamp(grid_idx, 0, GRID_SIZE - 1)
                         
                         logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
-                        pred_class = torch.argmax(logits).item()
+                        # Slice off class 0 (background) since we are querying at an active atom peak coordinate
+                        pred_class = torch.argmax(logits[1:]).item() + 1
                         if pred_class == gt_res_idx:
                             correct_res_count += 1
                             

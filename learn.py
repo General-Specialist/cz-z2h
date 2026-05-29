@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import biotite.structure.io.pdbx as pdbx
 
-EPOCHS=100
+EPOCHS=500
 LR=0.002
 GRID_SIZE=32
 BOX_SIZE=32.0
@@ -17,7 +17,7 @@ if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
-print("Using {device} as device")
+print(f"Using {DEVICE} as device")
 
 torch.manual_seed(42)
 
@@ -28,12 +28,13 @@ def load_coords(path):
     return torch.tensor(valid_atoms.coord, dtype=torch.float32)
 
 def kde(coords, sigma, noise=0.0):
+    device = coords.device
     # Center coords
     center = coords.mean(dim=0)
     centered_coords = coords - center + (BOX_SIZE/2.0)
 
     # Set up grid
-    ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)
+    ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE, device=device)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks,ticks,ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1,3) # [32768, 3]
 
@@ -60,10 +61,9 @@ class CNN(nn.Module):
             nn.ReLU(),
 
             nn.Conv3d(in_channels=16, out_channels=1, kernel_size=3, padding=1),
-            nn.ReLU(),
         )
     def forward(self, x):
-        return torch.sigmoid(self.net(x))
+        return self.net(x)
     
 def mse_loss(pred, target):
     return F.mse_loss(pred, target)
@@ -94,10 +94,10 @@ def find_peaks(predicted_grid):
     return grid_coords.float() * spacing
 
 if __name__ == "__main__": 
-    train_coords = load_coords(os.path.join(PDB_DIR, "1ubq.cif"))
-    test_coords = load_coords(os.path.join(PDB_DIR, "1crn.cif"))
+    train_coords = load_coords(os.path.join(PDB_DIR, "1ubq.cif")).to(DEVICE)
+    test_coords = load_coords(os.path.join(PDB_DIR, "1crn.cif")).to(DEVICE)
 
-    model = CNN()
+    model = CNN().to(DEVICE)
     train_model(model, train_coords)
 
     model.eval()

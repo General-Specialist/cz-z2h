@@ -9,6 +9,9 @@ from typing import Any
 import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 
+from tqdm import tqdm
+
+
 # ==============================================================================
 # CONSTANTS & CONFIGURATIONS
 # ==============================================================================
@@ -745,8 +748,8 @@ if __name__ == "__main__":
     torch.manual_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
 
-    # Select execution device (NVIDIA CUDA or CPU) early. Script should never run locally.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Select execution device (NVIDIA CUDA, Apple Silicon MPS, or CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
     print("===========================================================================")
     print(" PREPARING PDB MOLECULAR STRUCTURAL REPOSITORY ")
@@ -799,7 +802,7 @@ if __name__ == "__main__":
         # Pre-cache validation dataset from val_structures ONLY (no leakage!)
         print(f"\nPre-caching {NUM_VAL_CROPS} validation crops from validation structures...")
         val_dataset = []
-        for idx in range(NUM_VAL_CROPS):
+        for idx in tqdm(range(NUM_VAL_CROPS), desc="Pre-caching Val Crops"):
             val_input, val_target_atom, val_target_res = crop_and_rasterize_dynamic(val_structures, is_training=True)
             val_dataset.append((val_input, val_target_atom, val_target_res))
             if (idx + 1) % 50 == 0:
@@ -829,13 +832,19 @@ if __name__ == "__main__":
 
         steps_per_epoch = NUM_TRAIN_CROPS // BATCH_SIZE
 
-        print("\nTraining models on fold dataset...")
+        print(f"\nTraining models on fold dataset (Epochs: {NUM_EPOCHS})...")
         for epoch in range(1, NUM_EPOCHS + 1):
             atom_model.train()
             residue_model.train()
             train_loss = 0.0
 
-            for step in range(steps_per_epoch):
+            step_bar = tqdm(
+                range(steps_per_epoch),
+                desc=f"Epoch {epoch:02d}/{NUM_EPOCHS}",
+                bar_format="{l_bar}{bar:30}{r_bar}{bar:-10b}",
+                leave=True
+            )
+            for step in step_bar:
                 # Sample crops on-the-fly from train_structures ONLY (no leakage!)
                 batch_samples = [crop_and_rasterize_dynamic(train_structures, is_training=True) for _ in range(BATCH_SIZE)]
 
@@ -873,7 +882,9 @@ if __name__ == "__main__":
                 loss.backward()
                 optimizer.step()
 
-                train_loss += loss.item() * BATCH_SIZE
+                step_loss = loss.item()
+                train_loss += step_loss * BATCH_SIZE
+                step_bar.set_postfix(loss=f"{step_loss:.4f}")
 
             train_loss /= (steps_per_epoch * BATCH_SIZE)
 
@@ -914,7 +925,7 @@ if __name__ == "__main__":
             scheduler.step()
 
             current_lr = scheduler.get_last_lr()[0]
-            print(f"Epoch {epoch:02d}/{NUM_EPOCHS} | LR: {current_lr:.6f} | Train Loss: {train_loss:.3f} | Val Loss: {val_loss:.3f}")
+            tqdm.write(f"Epoch {epoch:02d}/{NUM_EPOCHS} | LR: {current_lr:.6f} | Train Loss: {train_loss:.3f} | Val Loss: {val_loss:.3f}")
 
             # Check for early stopping based on validation loss
             if val_loss < best_val_loss:
@@ -949,7 +960,7 @@ if __name__ == "__main__":
             pid_resolved_peaks = 0
 
             with torch.no_grad():
-                for test_idx in range(NUM_TEST_CROPS):
+                for test_idx in tqdm(range(NUM_TEST_CROPS), desc=f"Evaluating {pid.upper()}", leave=False):
                     test_input, test_target_atom, test_target_res, test_gt_coords, test_gt_res_indices = crop_and_rasterize_dynamic(
                         test_target_structure, return_coords=True, is_training=False
                     )
@@ -996,7 +1007,7 @@ if __name__ == "__main__":
                     pid_matched_atoms += matched_count
                     pid_correct_residues += correct_res_count
 
-            avg_peaks_per_crop = pid_resolved_peaks / len(test_dataset) if len(test_dataset) > 0 else 0.0
+            avg_peaks_per_crop = pid_resolved_peaks / NUM_TEST_CROPS if NUM_TEST_CROPS > 0 else 0.0
             recovery_pct = (pid_matched_atoms / pid_gt_atoms) * 100 if pid_gt_atoms > 0 else 0.0
             class_pct = (pid_correct_residues / pid_matched_atoms) * 100 if pid_matched_atoms > 0 else 0.0
 
@@ -1018,7 +1029,7 @@ if __name__ == "__main__":
             global_matched_atoms += pid_matched_atoms
             global_correct_residues += pid_correct_residues
             global_resolved_peaks += pid_resolved_peaks
-            global_num_crops += len(test_dataset)
+            global_num_crops += NUM_TEST_CROPS
 
         # Print Fold Summary
         print(f"\n--- FOLD {fold_idx + 1} SUMMARY ---")

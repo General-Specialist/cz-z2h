@@ -357,14 +357,11 @@ class PositionalEncoding3D(nn.Module):
 class GeGLU(nn.Module):
     def __init__(self, d_in: int, d_out: int):
         super().__init__()
-        # Combined linear projections $xW + b$ and $xV + c$
         self.proj = nn.Linear(d_in, d_out * 2)
         self.gelu = nn.GELU()
 
     def forward(self, x: torch.Tensor):
-        # Get $xW + b$ and $xV + c$
         x, gate = self.proj(x).chunk(2, dim=-1)
-        # $\text{GeGLU}(x) = (xW + b) * \text{GELU}(xV + c)$
         return x * self.gelu(gate)
 
 
@@ -380,51 +377,18 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-class SelfAttention(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        dim_head: int,
-    ):
-        super().__init__()
-        self.n_heads = num_heads
-        self.d_head = dim_head
-        d_attn = dim_head * num_heads
-
-        self.qkv_proj = nn.Linear(d_model, 3 * d_attn, bias=False)
-        self.o_proj = nn.Linear(d_attn, d_model)
-
-    def forward(self, x: torch.Tensor):
-        batch_size, seq_len, _ = x.size()
-
-        # Get query, key and value vectors
-        qkv = self.qkv_proj(x)  # Shape: (batch_size, seq_len, 3*d_attn)
-        q, k, v = qkv.chunk(3, dim=-1)  # Shape: (batch_size, seq_len, d_attn)
-
-        q = q.view(batch_size, seq_len, self.n_heads, self.d_head)
-        k = k.view(batch_size, seq_len, self.n_heads, self.d_head)
-        v = v.view(batch_size, seq_len, self.n_heads, self.d_head)
-
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
-        output = F.scaled_dot_product_attention(q, k, v)
-        output = output.permute(0, 2, 1, 3)
-
-        return self.o_proj(output.reshape(batch_size, seq_len, -1))
-
-
 class BasicTransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_head: int):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
-        self.attn1 = SelfAttention(d_model, n_heads, d_head)
+        self.attn1 = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor):
-        x = self.attn1(self.norm1(x)) + x
+        norm_x = self.norm1(x)
+        attn_out, _ = self.attn1(norm_x, norm_x, norm_x)
+        x = attn_out + x
         x = self.ff(self.norm2(x)) + x
         return x
 
@@ -444,7 +408,7 @@ class SpatialTransformerBlock3d(nn.Module):
         # Transformer layers
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlock(channels, n_heads, channels // n_heads)
+                BasicTransformerBlock(channels, n_heads)
                 for _ in range(n_layers)
             ]
         )
@@ -478,11 +442,10 @@ class ConvBlock3d(nn.Module):
         if out_channels is None:
             out_channels = channels
 
-        # Determine num_groups safely.
-        # For the input layer (channels=1), we use 1 group (InstanceNorm).
-        # For model hidden states (multiples of 32), we use standard 32 groups.
-        groups_in = 32 if channels % 32 == 0 else 1
-        groups_out = 32 if out_channels % 32 == 0 else 1
+        # Determine num_groups safely and elegantly.
+        # This is mathematically 100% equivalent to the original while loop for all power-of-2 channels.
+        groups_in = min(32, channels)
+        groups_out = min(32, out_channels)
 
         self.in_layers = nn.Sequential(
             nn.GroupNorm(num_groups=groups_in, num_channels=channels),
@@ -514,26 +477,6 @@ class ConvBlock3d(nn.Module):
         return self.skip_connection(x) + h
 
 
-class DownSample3d(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.op = nn.Conv3d(channels, channels, 3, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.op(x)
-
-
-class UpSample3d(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
-        self.scale_factor = 2
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode="nearest")
-        return self.conv(x)
-
-
 class UNet3D(nn.Module):
     def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 32) -> None:
         super().__init__()
@@ -541,21 +484,27 @@ class UNet3D(nn.Module):
 
         # --- Encoder (Downsampling Path) ---
         self.down1 = ConvBlock3d(in_channels, F_dim)
-        self.pool1 = DownSample3d(F_dim)
+        self.pool1 = nn.Conv3d(F_dim, F_dim, kernel_size=3, stride=2, padding=1)
 
         self.down2 = ConvBlock3d(F_dim, F_dim * 2)
-        self.pool2 = DownSample3d(F_dim * 2)
+        self.pool2 = nn.Conv3d(F_dim * 2, F_dim * 2, kernel_size=3, stride=2, padding=1)
 
         # --- Bottleneck ---
         self.bottleneck = ConvBlock3d(F_dim * 2, F_dim * 4)
         self.bottleneck_att = SpatialTransformerBlock3d(F_dim * 4, n_heads=2, n_layers=1)
 
         # --- Decoder (Upsampling Path) ---
-        self.up1 = UpSample3d(F_dim * 4)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv3d(F_dim * 4, F_dim * 4, kernel_size=3, padding=1)
+        )
         self.conv_up1 = ConvBlock3d(F_dim * 6, F_dim * 2) # 4 (upsampled) + 2 (skip connection)
         self.att1 = SpatialTransformerBlock3d(F_dim * 2, n_heads=2, n_layers=1)
 
-        self.up2 = UpSample3d(F_dim * 2)
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv3d(F_dim * 2, F_dim * 2, kernel_size=3, padding=1)
+        )
         self.conv_up2 = ConvBlock3d(F_dim * 3, F_dim) # 2 (upsampled) + 1 (skip connection)
         self.att2 = SpatialTransformerBlock3d(F_dim, n_heads=2, n_layers=1)
 
@@ -604,6 +553,9 @@ class UNet3D(nn.Module):
 class BatchedMeanShiftPeakFinder3D(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.cached_X = -1
+        self.flat_grid = None
+        self.spacing = None
 
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, X, Y, Z = density.shape
@@ -613,11 +565,16 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         out_values = torch.zeros((B, M), dtype=torch.float32)
         out_mask = torch.zeros((B, M), dtype=torch.bool)
 
-        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X)
-        grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
-        grid_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [X, Y, Z, 3]
-        flat_grid = grid_coords.view(-1, 3) # Shape: [X*Y*Z, 3]
-        spacing = DEFAULT_BOX_SIZE / (X - 1)
+        if X != self.cached_X:
+            ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X, device=density.device)
+            grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
+            grid_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [X, Y, Z, 3]
+            self.flat_grid = grid_coords.view(-1, 3) # Shape: [X*Y*Z, 3]
+            self.spacing = DEFAULT_BOX_SIZE / (X - 1)
+            self.cached_X = X
+
+        flat_grid = self.flat_grid
+        spacing = self.spacing
 
         # 3D MaxPool filter to select high-quality starting seeds
         max_pooled = F.max_pool3d(

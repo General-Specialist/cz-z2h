@@ -111,12 +111,11 @@ MAXPOOL_PEAK_STRIDE = 1
 MAXPOOL_PEAK_PADDING = 1
 PEAK_FINDER_EPSILON = 1e-8
 
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-    torch.set_default_device(DEVICE)
-    print(f"Using device: {DEVICE}")
-else:
-    print("Unable to access CUDA")
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available. This script requires a CUDA-enabled GPU.")
+
+torch.set_default_device("cuda")
+print("Using device: cuda")
 
 # ==============================================================================
 # UTILITIES, PIPELINES & DATA AUGMENTATION
@@ -334,9 +333,9 @@ class PositionalEncoding3D(nn.Module):
 
         self.cached_penc = None
         batch_size, x, y, z, orig_ch = tensor.shape
-        pos_x = torch.arange(x, device=DEVICE, dtype=self.inv_freq.dtype)
-        pos_y = torch.arange(y, device=DEVICE, dtype=self.inv_freq.dtype)
-        pos_z = torch.arange(z, device=DEVICE, dtype=self.inv_freq.dtype)
+        pos_x = torch.arange(x, dtype=self.inv_freq.dtype)
+        pos_y = torch.arange(y, dtype=self.inv_freq.dtype)
+        pos_z = torch.arange(z, dtype=self.inv_freq.dtype)
         sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
         sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
         sin_inp_z = torch.einsum("i,j->ij", pos_z, self.inv_freq)
@@ -345,7 +344,6 @@ class PositionalEncoding3D(nn.Module):
         emb_z = get_emb(sin_inp_z)
         emb = torch.zeros(
             (x, y, z, self.channels * 3),
-            device=DEVICE,
             dtype=tensor.dtype,
         )
         emb[:, :, :, : self.channels] = emb_x
@@ -762,7 +760,7 @@ if __name__ == "__main__":
     all_structures = {}
     for pid, filepath in pdb_files.items():
         all_coords, res_indices = load_coords_biotite(filepath)
-        all_structures[pid] = (all_coords.to(DEVICE), res_indices.to(DEVICE))
+        all_structures[pid] = (all_coords, res_indices)
         print(f"  Loaded {pid.upper()} | Atoms: {len(all_coords)}")
 
     # Partition the unified dataset into 10 folds

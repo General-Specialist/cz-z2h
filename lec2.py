@@ -1,4 +1,3 @@
-import os
 import random
 import itertools
 import numpy as np
@@ -112,6 +111,12 @@ MAXPOOL_PEAK_STRIDE = 1
 MAXPOOL_PEAK_PADDING = 1
 PEAK_FINDER_EPSILON = 1e-8
 
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    torch.set_default_device(DEVICE)
+    print(f"Using device: {DEVICE}")
+else:
+    print("Unable to access CUDA")
 
 # ==============================================================================
 # UTILITIES, PIPELINES & DATA AUGMENTATION
@@ -133,15 +138,14 @@ def load_coords_biotite(filepath: str) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
-    device = coords.device
     # Generate the 3D grid ticks
-    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
     g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
 
     g2 = torch.sum(g_flat ** 2, dim=-1, keepdim=True) # Shape: [G^3, 1]
-    density_flat = torch.zeros(g_flat.shape[0], device=device)
+    density_flat = torch.zeros(g_flat.shape[0])
 
     # Process atoms in chunks to cap GPU memory footprint
     chunk_size = RASTER_CHUNK_SIZE
@@ -159,15 +163,14 @@ def coords_to_density(coords: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
-    device = coords.device
     # Generate the 3D grid ticks
-    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
     g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
 
     g2 = torch.sum(g_flat ** 2, dim=-1, keepdim=True) # Shape: [G^3, 1]
-    min_dists_flat = torch.full((g_flat.shape[0],), float('inf'), device=device)
+    min_dists_flat = torch.full((g_flat.shape[0],), float('inf'))
 
     # Process atoms in chunks to cap GPU memory footprint
     chunk_size = RASTER_CHUNK_SIZE
@@ -187,16 +190,15 @@ def coords_to_binary_grid(coords: torch.Tensor) -> torch.Tensor:
 
 
 def coords_to_residue_grid(coords: torch.Tensor, res_indices: torch.Tensor) -> torch.Tensor:
-    device = coords.device
     # Generate the 3D grid ticks
-    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=device)
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [G, G, G, 3]
     g_flat = grid.view(-1, 3) # Shape: [G^3, 3]
 
     g2 = torch.sum(g_flat ** 2, dim=-1, keepdim=True) # Shape: [G^3, 1]
-    min_dists_flat = torch.full((g_flat.shape[0],), float('inf'), device=device)
-    nearest_indices = torch.full((g_flat.shape[0],), -1, dtype=torch.long, device=device)
+    min_dists_flat = torch.full((g_flat.shape[0],), float('inf'))
+    nearest_indices = torch.full((g_flat.shape[0],), -1, dtype=torch.long)
 
     # Process atoms in chunks to cap GPU memory footprint
     chunk_size = RASTER_CHUNK_SIZE
@@ -214,7 +216,7 @@ def coords_to_residue_grid(coords: torch.Tensor, res_indices: torch.Tensor) -> t
         nearest_indices[update_mask] = chunk_arg[update_mask] + i
 
     # Map nearest indices to residue indices
-    residue_grid_flat = torch.zeros(g_flat.shape[0], dtype=torch.long, device=device)
+    residue_grid_flat = torch.zeros(g_flat.shape[0], dtype=torch.long)
     valid_mask = min_dists_flat <= DEFAULT_RADIUS
     residue_grid_flat[valid_mask] = res_indices[nearest_indices[valid_mask]]
 
@@ -332,9 +334,9 @@ class PositionalEncoding3D(nn.Module):
 
         self.cached_penc = None
         batch_size, x, y, z, orig_ch = tensor.shape
-        pos_x = torch.arange(x, device=tensor.device, dtype=self.inv_freq.dtype)
-        pos_y = torch.arange(y, device=tensor.device, dtype=self.inv_freq.dtype)
-        pos_z = torch.arange(z, device=tensor.device, dtype=self.inv_freq.dtype)
+        pos_x = torch.arange(x, device=DEVICE, dtype=self.inv_freq.dtype)
+        pos_y = torch.arange(y, device=DEVICE, dtype=self.inv_freq.dtype)
+        pos_z = torch.arange(z, device=DEVICE, dtype=self.inv_freq.dtype)
         sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
         sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
         sin_inp_z = torch.einsum("i,j->ij", pos_z, self.inv_freq)
@@ -343,7 +345,7 @@ class PositionalEncoding3D(nn.Module):
         emb_z = get_emb(sin_inp_z)
         emb = torch.zeros(
             (x, y, z, self.channels * 3),
-            device=tensor.device,
+            device=DEVICE,
             dtype=tensor.dtype,
         )
         emb[:, :, :, : self.channels] = emb_x
@@ -618,14 +620,13 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
 
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, X, Y, Z = density.shape
-        device = density.device
 
         M = DEFAULT_MAX_PEAKS
-        out_coords = torch.zeros((B, M, 3), dtype=torch.float32, device=device)
-        out_values = torch.zeros((B, M), dtype=torch.float32, device=device)
-        out_mask = torch.zeros((B, M), dtype=torch.bool, device=device)
+        out_coords = torch.zeros((B, M, 3), dtype=torch.float32)
+        out_values = torch.zeros((B, M), dtype=torch.float32)
+        out_mask = torch.zeros((B, M), dtype=torch.bool)
 
-        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X, device=device)
+        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X)
         grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
         grid_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1) # Shape: [X, Y, Z, 3]
         flat_grid = grid_coords.view(-1, 3) # Shape: [X*Y*Z, 3]
@@ -680,7 +681,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
             final_probs = final_probs[sorted_idx]
 
             # 5. Greedy spatial deduplication to resolve overlaps
-            keep_mask = torch.ones(seeds.shape[0], dtype=torch.bool, device=device)
+            keep_mask = torch.ones(seeds.shape[0], dtype=torch.bool)
             for idx in range(seeds.shape[0]):
                 if not keep_mask[idx]:
                     continue
@@ -748,9 +749,6 @@ if __name__ == "__main__":
     torch.manual_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
 
-    # Select execution device (NVIDIA CUDA, Apple Silicon MPS, or CPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-
     print("===========================================================================")
     print(" PREPARING PDB MOLECULAR STRUCTURAL REPOSITORY ")
     print("===========================================================================")
@@ -764,7 +762,7 @@ if __name__ == "__main__":
     all_structures = {}
     for pid, filepath in pdb_files.items():
         all_coords, res_indices = load_coords_biotite(filepath)
-        all_structures[pid] = (all_coords.to(device), res_indices.to(device))
+        all_structures[pid] = (all_coords.to(DEVICE), res_indices.to(DEVICE))
         print(f"  Loaded {pid.upper()} | Atoms: {len(all_coords)}")
 
     # Partition the unified dataset into 10 folds
@@ -813,9 +811,6 @@ if __name__ == "__main__":
         atom_model = UNet3D(in_channels=1, out_channels=1, init_features=UNET_INIT_FEATURES)
         residue_model = UNet3D(in_channels=1, out_channels=len(RESIDUE_MAP) + 1, init_features=UNET_INIT_FEATURES)
 
-        atom_model.to(device)
-        residue_model.to(device)
-
         optimizer = torch.optim.Adam(
             itertools.chain(atom_model.parameters(), residue_model.parameters()),
             lr=LEARNING_RATE
@@ -824,7 +819,7 @@ if __name__ == "__main__":
 
         criterion_atom = BCEDiceLoss()
         criterion_residue = nn.CrossEntropyLoss()
-        peak_finder = BatchedMeanShiftPeakFinder3D().to(device)
+        peak_finder = BatchedMeanShiftPeakFinder3D()
 
         # Train loop
         best_val_loss = float('inf')
@@ -848,9 +843,9 @@ if __name__ == "__main__":
                 # Sample crops on-the-fly from train_structures ONLY (no leakage!)
                 batch_samples = [crop_and_rasterize_dynamic(train_structures, is_training=True) for _ in range(BATCH_SIZE)]
 
-                inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1).to(device)
-                atom_targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1).to(device)
-                residue_targets = torch.stack([sample[2] for sample in batch_samples]).long().to(device)
+                inputs = torch.stack([sample[0] for sample in batch_samples]).unsqueeze(1)
+                atom_targets = torch.stack([sample[1] for sample in batch_samples]).unsqueeze(1)
+                residue_targets = torch.stack([sample[2] for sample in batch_samples]).long()
 
                 # Apply boundary-preserving random 3D flips and rotations jointly
                 inputs, atom_targets, residue_targets = augment_batch_3d_joint(inputs, atom_targets, residue_targets)
@@ -894,9 +889,9 @@ if __name__ == "__main__":
             val_loss = 0.0
             with torch.no_grad():
                 for idx, (val_input, val_target_atom, val_target_res) in enumerate(val_dataset):
-                    val_input_tensor = val_input.unsqueeze(0).unsqueeze(0).to(device)
-                    val_target_atom_tensor = val_target_atom.unsqueeze(0).unsqueeze(0).to(device)
-                    val_target_res_tensor = val_target_res.unsqueeze(0).to(device)
+                    val_input_tensor = val_input.unsqueeze(0).unsqueeze(0)
+                    val_target_atom_tensor = val_target_atom.unsqueeze(0).unsqueeze(0)
+                    val_target_res_tensor = val_target_res.unsqueeze(0)
 
                     # Forward pass with deep supervision enabled
                     val_atom_pred, val_atom_ds = atom_model(val_input_tensor, return_ds=True)
@@ -964,7 +959,7 @@ if __name__ == "__main__":
                     test_input, test_target_atom, test_target_res, test_gt_coords, test_gt_res_indices = crop_and_rasterize_dynamic(
                         test_target_structure, return_coords=True, is_training=False
                     )
-                    test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
+                    test_in_batch = test_input.unsqueeze(0).unsqueeze(0)
 
                     # Predict atom density and resolve peaks
                     pred_density = F.relu(torch.sigmoid(atom_model(test_in_batch)))

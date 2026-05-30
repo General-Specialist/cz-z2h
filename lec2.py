@@ -472,37 +472,26 @@ class SpatialTransformerBlock3d(nn.Module):
         return x + x_in
 
 
-class GroupNorm32(nn.GroupNorm):
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return super().forward(input.float()).type(input.dtype)
-
-
-def normalization(channels):
-    num_groups = 32
-    while num_groups > 1:
-        if channels % num_groups == 0:
-            break
-        num_groups //= 2
-    if num_groups == 0 or channels % num_groups != 0:
-        num_groups = 1
-    return GroupNorm32(num_groups, channels)
-
-
-
 class ConvBlock3d(nn.Module):
     def __init__(self, channels: int, out_channels=None, kernel_size=3):
         super().__init__()
         if out_channels is None:
             out_channels = channels
 
+        # Determine num_groups safely.
+        # For the input layer (channels=1), we use 1 group (InstanceNorm).
+        # For model hidden states (multiples of 32), we use standard 32 groups.
+        groups_in = 32 if channels % 32 == 0 else 1
+        groups_out = 32 if out_channels % 32 == 0 else 1
+
         self.in_layers = nn.Sequential(
-            normalization(channels),
+            nn.GroupNorm(num_groups=groups_in, num_channels=channels),
             nn.SiLU(),
             nn.Conv3d(channels, out_channels, 3, padding=1),
         )
 
         self.out_layers = nn.Sequential(
-            normalization(out_channels),
+            nn.GroupNorm(num_groups=groups_out, num_channels=out_channels),
             nn.SiLU(),
             nn.Dropout(0.0),
             nn.Conv3d(

@@ -3,28 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class Convo(nn.Module):
-    def __init__(self, in_channels, out_channels=None, kernel_size=3):
+    def __init__(self, in_channels, out_channels, kernel_size=3):
         super().__init__()
-        if out_channels is None:
-            out_channels = in_channels
 
-        # Skip connection logic
         if out_channels == in_channels:
             self.skip_connection = nn.Identity()
         else:
             self.skip_connection = nn.Conv3d(in_channels, out_channels, 1)
 
-        groups_in = min(32, in_channels)
-        groups_out = min(32, out_channels)
-
         self.in_layers = nn.Sequential(
-            nn.GroupNorm(num_groups=groups_in, num_channels=in_channels),
+            nn.GroupNorm(num_groups=min(32, in_channels), num_channels=in_channels),
             nn.SiLU(),
             nn.Conv3d(in_channels, out_channels, 3, padding=1)
         )
 
         self.out_layers = nn.Sequential(
-            nn.GroupNorm(num_groups=groups_out, num_channels=out_channels),
+            nn.GroupNorm(num_groups=min(32, out_channels), num_channels=out_channels),
             nn.SiLU(),
             nn.Dropout(0.0),
             nn.Conv3d(

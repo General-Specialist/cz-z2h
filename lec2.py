@@ -437,20 +437,18 @@ class SpatialTransformerBlock3d(nn.Module):
 
 
 class ConvBlock3d(nn.Module):
-    def __init__(self, channels: int, out_channels=None, kernel_size=3):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size=3):
         super().__init__()
-        if out_channels is None:
-            out_channels = channels
 
         # Determine num_groups safely and elegantly.
         # This is mathematically 100% equivalent to the original while loop for all power-of-2 channels.
-        groups_in = min(32, channels)
+        groups_in = min(32, in_channels)
         groups_out = min(32, out_channels)
 
         self.in_layers = nn.Sequential(
-            nn.GroupNorm(num_groups=groups_in, num_channels=channels),
+            nn.GroupNorm(num_groups=groups_in, num_channels=in_channels),
             nn.SiLU(),
-            nn.Conv3d(channels, out_channels, 3, padding=1),
+            nn.Conv3d(in_channels, out_channels, 3, padding=1),
         )
 
         self.out_layers = nn.Sequential(
@@ -466,10 +464,10 @@ class ConvBlock3d(nn.Module):
             ),
         )
 
-        if out_channels == channels:
+        if out_channels == in_channels:
             self.skip_connection = nn.Identity()
         else:
-            self.skip_connection = nn.Conv3d(channels, out_channels, 1)
+            self.skip_connection = nn.Conv3d(in_channels, out_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.in_layers(x)

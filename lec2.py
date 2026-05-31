@@ -79,7 +79,7 @@ def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: 
     return density, binary_grid, residue_grid.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
 
-def crop_and_rasterize_dynamic(structures: list, is_training: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, return_coords: bool = False) -> tuple:
     coords, res_indices = random.choice(structures)
     center = coords[torch.randint(0, len(coords), (1,)).item()]
 
@@ -93,7 +93,11 @@ def crop_and_rasterize_dynamic(structures: list, is_training: bool = False) -> t
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
 
     density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=DEFAULT_RADIUS)
-    return F.relu(density + torch.randn_like(density) * noise), binary_grid, residue_grid
+    
+    out_density = F.relu(density + torch.randn_like(density) * noise)
+    if return_coords:
+        return out_density, binary_grid, residue_grid, cropped_coords, cropped_res
+    return out_density, binary_grid, residue_grid
 
 
 def augment_batch_3d_joint(inputs: torch.Tensor, target_atoms: torch.Tensor, target_res: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -549,6 +553,85 @@ if __name__ == "__main__":
                 val_loss /= val_steps
                 
             print(f"U-Net Epoch {epoch:03d}/500 | Train Loss: {epoch_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    # --------------------------------------------------------------------------
+    # U-NET COORDINATE ACCURACY EVALUATION (WITHOUT LEAKAGE)
+    # --------------------------------------------------------------------------
+    print("\n" + "-"*70)
+    print(" PIPELINE 1: EVALUATING COORDINATE RECOVERY & CLASSIFICATION ")
+    print("-"*70)
+    
+    unet_atom.eval(); unet_res.eval()
+    peak_finder = BatchedMeanShiftPeakFinder3D().to(device)
+    MATCHING_RADIUS = 1.5  # Angstroms
+    
+    total_gt_atoms = 0
+    total_matched_atoms = 0
+    total_correct_residues = 0
+    total_resolved_peaks = 0
+    
+    num_eval_crops = 20  # Evaluate on 20 random unseen validation crops!
+    spacing = DEFAULT_BOX_SIZE / (GRID_SIZE - 1)
+    
+    with torch.no_grad():
+        for i in range(num_eval_crops):
+            # Sample unseen validation crop with return_coords=True
+            val_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
+                v_val, is_training=False, return_coords=True
+            )
+            val_in_batch = val_input.unsqueeze(0).unsqueeze(0).to(device)
+            
+            # Predict density and find peaks
+            pred_density = F.relu(unet_atom(val_in_batch))
+            pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+            
+            # Predict residue classes
+            pred_res_logits = unet_res(val_in_batch)
+            
+            pred_coords = pred_coords[0].cpu()
+            pred_mask = pred_mask[0].cpu()
+            
+            num_pred_peaks = pred_mask.sum().item()
+            num_gt_peaks = len(gt_coords)
+            
+            total_resolved_peaks += num_pred_peaks
+            total_gt_atoms += num_gt_peaks
+            
+            matched_count = 0
+            correct_res_count = 0
+            
+            for j, gt_c in enumerate(gt_coords):
+                gt_res_idx = gt_res_indices[j].item()
+                if num_pred_peaks > 0:
+                    distances = torch.norm(pred_coords[:num_pred_peaks] - gt_c.cpu(), dim=-1)
+                    min_dist, min_idx = torch.min(distances, dim=0)
+                    if min_dist.item() <= MATCHING_RADIUS:
+                        matched_count += 1
+                        
+                        # Query predicted residue class
+                        p_coord = pred_coords[min_idx.item()]
+                        grid_idx = torch.round(p_coord / spacing).long()
+                        grid_idx = torch.clamp(grid_idx, 0, GRID_SIZE - 1)
+                        
+                        logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
+                        pred_class = torch.argmax(logits[1:]).item() + 1
+                        if pred_class == gt_res_idx:
+                            correct_res_count += 1
+                            
+            total_matched_atoms += matched_count
+            total_correct_residues += correct_res_count
+            
+    avg_recovery = (total_matched_atoms / total_gt_atoms) * 100 if total_gt_atoms > 0 else 0.0
+    avg_classification = (total_correct_residues / total_matched_atoms) * 100 if total_matched_atoms > 0 else 0.0
+    
+    print(f"Evaluated over {num_eval_crops} unseen crops from validation PDBs:")
+    print(f"  Average predicted peaks per crop: {total_resolved_peaks / num_eval_crops:.1f}")
+    print(f"  Total Ground Truth Atoms across all crops: {total_gt_atoms}")
+    print(f"  Total Matched Atoms (within {MATCHING_RADIUS} Å): {total_matched_atoms}")
+    print(f"  Total Correct Residue Predictions: {total_correct_residues}")
+    print(f"  Overall Coordinate Recovery Accuracy: {avg_recovery:.1f}%")
+    print(f"  Overall Residue Classification Accuracy: {avg_classification:.1f}%")
+    print("="*70 + "\n")
 
     # --------------------------------------------------------------------------
     # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION (LECTURE 3)

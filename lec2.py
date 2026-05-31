@@ -1,6 +1,5 @@
 import os
 import random
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,9 +26,9 @@ RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(sorted(list(ALL_RESIDUES))
 # PDB datasets
 PDB_IDS = ["1ubq", "1pga", "1shg", "1csp", "1a70", "1crn", "2cro", "1acx"]
 
-GRID_SIZE = 32
-DEFAULT_BOX_SIZE = 8.0
-DEFAULT_RADIUS = 0.8
+GRID_SIZE = 64
+DEFAULT_BOX_SIZE = 32.0
+DEFAULT_RADIUS = 1.5
 
 # Mean-Shift Peak Finding Constants
 DEFAULT_PEAK_THRESHOLD = 0.30
@@ -44,12 +43,13 @@ EMBED_DIM_Z = 32
 NUM_HEADS = 4
 NUM_BLOCKS = 3
 MAX_REL_POS = 32
+CONTACT_THRESHOLD = 8.0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ==============================================================================
-# SECTION 1: ELEGANT VECTORIZED RASTERIZATION & DATA PIPELINE
+# SECTION 1: ELEGANT RASTERIZATION & DATA PIPELINE
 # ==============================================================================
 
 def download_pdb_cif(pdb_id: str) -> str:
@@ -61,60 +61,48 @@ def download_pdb_cif(pdb_id: str) -> str:
 
 def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: float = 0.8, radius: float = 0.8) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Unifies coords_to_density, coords_to_binary_grid, and coords_to_residue_grid 
-    into a single vectorized, chunk-free function using torch.cdist.
+    Vectorized, chunk-free grid rasterization using torch.cdist.
     """
     ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=coords.device)
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
-    grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)  # [G^3, 3]
-    
-    # Distance matrix between grid voxels and atom coordinates
-    dists = torch.cdist(grid, coords)  # [G^3, N_atoms]
-    
-    # 1. Continuous blurred density grid
+    grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)
+
+    dists = torch.cdist(grid, coords)
     density = torch.exp(-dists**2 / (2 * sigma**2)).sum(dim=-1).view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
-    
-    # 2. Binary target detection grid
     binary_grid = (dists <= radius).any(dim=-1).float().view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
-    
-    # 3. Residue multi-class grid (closest atom mapping within radius)
+
     min_dists, min_idx = torch.min(dists, dim=-1)
     residue_grid = torch.zeros(grid.shape[0], dtype=torch.long, device=coords.device)
     valid_mask = min_dists <= radius
     residue_grid[valid_mask] = res_indices[min_idx[valid_mask]]
-    
+
     return density, binary_grid, residue_grid.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
 
 
 def crop_and_rasterize_dynamic(structures: list, is_training: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     coords, res_indices = random.choice(structures)
     center = coords[torch.randint(0, len(coords), (1,)).item()]
-    
+
     half_box = DEFAULT_BOX_SIZE / 2.0
     mask = torch.all((coords >= center - half_box) & (coords <= center + half_box), dim=-1)
-    
+
     cropped_coords = coords[mask] - center + half_box
     cropped_res = res_indices[mask]
-    
+
     sigma = random.uniform(0.8, 1.8) if is_training else 1.2
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
-    
+
     density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=DEFAULT_RADIUS)
-    
-    # Simulate map noise
-    noisy_density = F.relu(density + torch.randn_like(density) * noise)
-    return noisy_density, binary_grid, residue_grid
+    return F.relu(density + torch.randn_like(density) * noise), binary_grid, residue_grid
 
 
 def augment_batch_3d_joint(inputs: torch.Tensor, target_atoms: torch.Tensor, target_res: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     for b in range(inputs.shape[0]):
-        # Boundary-preserving flips
         for dim in (-3, -2, -1):
             if random.random() > 0.5:
                 inputs[b] = torch.flip(inputs[b], [dim])
                 target_atoms[b] = torch.flip(target_atoms[b], [dim])
                 target_res[b] = torch.flip(target_res[b], [dim])
-        # Joint 90-degree rotations
         for plane in [(-3, -2), (-2, -1), (-3, -1)]:
             k = random.randint(0, 3)
             if k > 0:
@@ -125,28 +113,29 @@ def augment_batch_3d_joint(inputs: torch.Tensor, target_atoms: torch.Tensor, tar
 
 
 class BCEDiceLoss(nn.Module):
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy(pred, target)
-        p_flat = pred.flatten(1)
-        t_flat = target.flatten(1)
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(logits, target)
+        pred = torch.sigmoid(logits)
+        p_flat, t_flat = pred.flatten(1), target.flatten(1)
         intersection = (p_flat * t_flat).sum(dim=-1)
         dice = 1.0 - (2.0 * intersection + 1e-6) / (p_flat.sum(dim=-1) + t_flat.sum(dim=-1) + 1e-6)
         return bce + dice.mean()
 
 
-# ==============================================================================
-# SECTION 2: HIGHLY CONCISE 3D U-NET (Lecture 2)
-# ==============================================================================
+def find_groups(c: int) -> int:
+    """Finds a divisor of c that is <= 32 to satisfy nn.GroupNorm divisibility rules."""
+    for g in [32, 16, 8, 4, 2]:
+        if c % g == 0: return g
+    return 1
+
 
 class ConvBlock3d(nn.Module):
     def __init__(self, in_c: int, out_c: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.GroupNorm(min(32, in_c), in_c),
-            nn.SiLU(),
+            nn.GroupNorm(find_groups(in_c), in_c), nn.SiLU(),
             nn.Conv3d(in_c, out_c, 3, padding=1),
-            nn.GroupNorm(min(32, out_c), out_c),
-            nn.SiLU(),
+            nn.GroupNorm(find_groups(out_c), out_c), nn.SiLU(),
             nn.Conv3d(out_c, out_c, 3, padding=1)
         )
         self.skip = nn.Identity() if in_c == out_c else nn.Conv3d(in_c, out_c, 1)
@@ -156,19 +145,14 @@ class ConvBlock3d(nn.Module):
 
 
 class SpatialTransformerBlock3d(nn.Module):
-    """
-    Super-compact 3D self-attention block replacing >120 lines of redundant code.
-    """
-    def __init__(self, channels: int, n_heads: int, n_layers: int = 1):
+    def __init__(self, channels: int, n_heads: int):
         super().__init__()
-        self.norm = nn.GroupNorm(min(32, channels), channels)
+        self.norm = nn.GroupNorm(find_groups(channels), channels)
         self.proj_in = nn.Conv3d(channels, channels, 1)
         self.proj_out = nn.Conv3d(channels, channels, 1)
         self.attn = nn.MultiheadAttention(channels, n_heads, batch_first=True)
         self.ff = nn.Sequential(
-            nn.Linear(channels, channels * 4),
-            nn.GELU(),
-            nn.Linear(channels * 4, channels)
+            nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
         self.norm_attn = nn.LayerNorm(channels)
         self.norm_ff = nn.LayerNorm(channels)
@@ -178,11 +162,8 @@ class SpatialTransformerBlock3d(nn.Module):
         h_in = x
         x = self.norm(x)
         x = self.proj_in(x).permute(0, 2, 3, 4, 1).view(b, h * w * d, c)
-        
-        # Multi-head attention & Feedforward blocks
         x = x + self.attn(self.norm_attn(x), self.norm_attn(x), self.norm_attn(x))[0]
         x = x + self.ff(self.norm_ff(x))
-        
         x = x.view(b, h, w, d, c).permute(0, 4, 1, 2, 3)
         return h_in + self.proj_out(x)
 
@@ -195,18 +176,18 @@ class UNet3D(nn.Module):
         self.pool1 = nn.Conv3d(f, f, 3, stride=2, padding=1)
         self.down2 = ConvBlock3d(f, f * 2)
         self.pool2 = nn.Conv3d(f * 2, f * 2, 3, stride=2, padding=1)
-        
+
         self.bottleneck = nn.Sequential(
             ConvBlock3d(f * 2, f * 4),
             SpatialTransformerBlock3d(f * 4, n_heads=2)
         )
-        
+
         self.up1 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv3d(f * 4, f * 4, 3, padding=1))
-        self.conv_up1 = nn.Sequential(ConvBlock3d(f * 6, f * 2), SpatialTransformerBlock3d(f * 2, n_heads=2))
-        
+        self.conv_up1 = ConvBlock3d(f * 6, f * 2)
+
         self.up2 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv3d(f * 2, f * 2, 3, padding=1))
-        self.conv_up2 = nn.Sequential(ConvBlock3d(f * 3, f), SpatialTransformerBlock3d(f, n_heads=2))
-        
+        self.conv_up2 = ConvBlock3d(f * 3, f)
+
         self.out_conv = nn.Conv3d(f, out_channels, 1)
         self.ds_conv = nn.Conv3d(f * 2, out_channels, 1)
 
@@ -215,15 +196,15 @@ class UNet3D(nn.Module):
         p1 = self.pool1(x1)
         x2 = self.down2(p1)
         p2 = self.pool2(x2)
-        
+
         b = self.bottleneck(p2)
-        
+
         u1 = self.up1(b)
         x3 = self.conv_up1(torch.cat([u1, x2], dim=1))
-        
+
         u2 = self.up2(x3)
         x4 = self.conv_up2(torch.cat([u2, x1], dim=1))
-        
+
         out = self.out_conv(x4)
         if return_ds:
             return out, self.ds_conv(x3)
@@ -239,44 +220,43 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         B, C, X, Y, Z = density.shape
         M = DEFAULT_MAX_PEAKS
         spacing = DEFAULT_BOX_SIZE / (X - 1)
-        
+
         ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X, device=density.device)
         grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)
-        
+
         max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
         peaks = (density == max_pooled) & (density > DEFAULT_PEAK_THRESHOLD)
-        
+
         out_coords = torch.zeros(B, M, 3, device=density.device)
         out_vals = torch.zeros(B, M, device=density.device)
         out_mask = torch.zeros(B, M, dtype=torch.bool, device=density.device)
-        
+
         for b in range(B):
             b_dens = density[b, 0]
             b_peaks = peaks[b, 0].view(-1)
-            
+
             active_coords = grid[b_dens.view(-1) > DEFAULT_PEAK_THRESHOLD]
             active_weights = b_dens[b_dens > DEFAULT_PEAK_THRESHOLD]
-            
+
             seeds = grid[b_peaks][:M]
             if len(seeds) == 0: continue
-            
+
             for _ in range(DEFAULT_PEAK_ITERATIONS):
                 dists = torch.cdist(seeds, active_coords)
                 weights = torch.exp(-dists**2 / (2 * DEFAULT_PEAK_BANDWIDTH**2)) * active_weights
                 seeds = torch.matmul(weights, active_coords) / (weights.sum(dim=-1, keepdim=True) + 1e-8)
-                
-            # deduplicate
+
             keep = torch.ones(len(seeds), dtype=torch.bool, device=density.device)
             for i in range(len(seeds)):
                 if not keep[i]: continue
                 keep[i+1:][torch.norm(seeds[i+1:] - seeds[i], dim=-1) < CLASH_LIMIT] = False
             seeds = seeds[keep][:M]
-            
+
             n = len(seeds)
             out_coords[b, :n] = seeds
             out_vals[b, :n] = b_dens[(seeds / spacing).round().long().clamp(0, X-1).unbind(dim=-1)]
             out_mask[b, :n] = True
-            
+
         return out_coords, out_vals, out_mask
 
 
@@ -294,8 +274,7 @@ class RelativePositionEmbedding(nn.Module):
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
         pos = torch.arange(seq_len, device=device)
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)
-        clipped_diff = torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos)
-        return self.emb(clipped_diff + self.max_rel_pos)
+        return self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)
 
 
 class SequenceToPairInitializer(nn.Module):
@@ -327,23 +306,23 @@ class AttentionPairBias(nn.Module):
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
         B, N, _ = s.shape
         H = self.n_heads
-        
+
         q = self.proj_q(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3)
         k = self.proj_k(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3)
         v = self.proj_v(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3)
-        
+
         logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
         bias = self.proj_bias(z).permute(0, 3, 1, 2)
-        
+
         attn_probs = F.softmax(logits + bias, dim=-1)
         out = torch.matmul(attn_probs, v)
-        
+
         gate = torch.sigmoid(self.proj_gate(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3))
         out = (out * gate).permute(0, 2, 1, 3).contiguous().view(B, N, self.c_s)
-        
+
         if shape_watch:
             print(f"    [Shape Watcher - AttentionPairBias]\n      s={list(s.shape)}, z={list(z.shape)}, Q/K/V heads={list(q.shape)}")
-            
+
         return self.proj_out(out)
 
 
@@ -361,10 +340,10 @@ class OuterProductMean(nn.Module):
         b = self.lin2(s_norm)
         outer = torch.einsum("b i c, b j d -> b i j c d", a, b).flatten(start_dim=-2)
         out = self.lin_out(outer)
-        
+
         if shape_watch:
             print(f"    [Shape Watcher - OuterProductMean]\n      outer_flat={list(outer.shape)}, z_update={list(out.shape)}")
-            
+
         return out
 
 
@@ -385,10 +364,10 @@ class TriangleMultiplicativeUpdate(nn.Module):
         b = torch.sigmoid(self.lin_gate_b(z_norm)) * self.lin_b(z_norm)
         out = torch.einsum("b i k c, b j k c -> b i j c", a, b)
         final_out = self.lin_out(out) * torch.sigmoid(self.lin_gate_out(z_norm))
-        
+
         if shape_watch:
             print(f"    [Shape Watcher - TriangleMultiplicativeUpdate]\n      gathered_sum={list(out.shape)}")
-            
+
         return final_out
 
 
@@ -458,10 +437,180 @@ def print_ascii_contact_map(gt: torch.Tensor, pred: torch.Tensor, threshold: flo
 
 
 # ==============================================================================
-# SECTION 5: MINIMALIST U-NET TRAINING LOOP
+# SECTION 5: DUAL GOOGLE COLAB TRAINING PIPELINE
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Note: As per the top comments in other modules, this file is fully designed 
-    # for offline compilation/integration. Do not execute this structural module directly.
-    pass
+    torch.manual_seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    print("===========================================================================")
+    print(" PREPARING MOLECULAR DATABASE ")
+    print("===========================================================================")
+
+    os.makedirs(DEFAULT_SAVE_DIR, exist_ok=True)
+    all_structures = {}
+    for pid in tqdm(PDB_IDS, desc="Caching mmCIF files"):
+        filepath = download_pdb_cif(pid)
+        try:
+            atoms = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
+            # 1. 3D Volumetric representations (All atoms)
+            valid_atoms = atoms[np.isin(atoms.res_name, list(ALL_RESIDUES))]
+            v_coords = torch.tensor(valid_atoms.coord, dtype=torch.float32)
+            v_res_idx = torch.tensor([RESIDUE_MAP[name] for name in valid_atoms.res_name], dtype=torch.long)
+
+            # 2. 1D Sequential representations (C-alpha deduplicated)
+            rep_atoms = atoms[(atoms.atom_name == "CA") | (atoms.atom_name == "C4'") | (atoms.atom_name == "P")]
+            seen = set()
+            filtered = []
+            for idx in range(len(rep_atoms)):
+                res_key = (rep_atoms.chain_id[idx], rep_atoms.res_id[idx])
+                if res_key not in seen:
+                    seen.add(res_key)
+                    filtered.append(idx)
+            rep_atoms = rep_atoms[filtered]
+            s_seq = torch.tensor([RESIDUE_MAP.get(name, 0) for name in rep_atoms.res_name], dtype=torch.long)
+            s_coords = torch.tensor(rep_atoms.coord, dtype=torch.float32)
+
+            all_structures[pid] = {
+                "v_coords": v_coords, "v_res_idx": v_res_idx,
+                "s_seq": s_seq, "s_coords": s_coords
+            }
+        except Exception as e:
+            print(f"Failed to load PDB {pid}: {e}")
+
+    # --------------------------------------------------------------------------
+    # DEMO 1: 3D VOLUMETRIC U-NET PIPELINE (LECTURE 2)
+    # --------------------------------------------------------------------------
+    print("\n" + "="*70)
+    print(" PIPELINE 1: TRAINING 3D VOLUMETRIC U-NET DEMO ")
+    print("="*70)
+
+    structs_list = list(all_structures.values())
+    v_train = [(s["v_coords"], s["v_res_idx"]) for s in structs_list[:-2]]
+    v_val = [(s["v_coords"], s["v_res_idx"]) for s in structs_list[-2:]]
+
+    unet_atom = UNet3D(1, 1, init_features=16).to(device)
+    unet_res = UNet3D(1, len(RESIDUE_MAP) + 1, init_features=16).to(device)
+    opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001)
+    criterion_atom = BCEDiceLoss()
+    criterion_res = nn.CrossEntropyLoss(ignore_index=0)
+
+    def compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res):
+        loss_atom_main = criterion_atom(pred_atom, target_atoms)
+        loss_res_main = criterion_res(pred_res, target_res)
+        
+        target_atoms_ds = F.max_pool3d(target_atoms, kernel_size=2, stride=2)
+        target_res_ds = F.max_pool3d(target_res.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()
+        
+        loss_atom_ds = criterion_atom(ds_atom, target_atoms_ds)
+        loss_res_ds = criterion_res(ds_res, target_res_ds)
+        return loss_atom_main + loss_res_main + 0.5 * (loss_atom_ds + loss_res_ds)
+
+    # Train 500 epochs to demonstrate map fitting (evaluating validation and printing every 50 epochs)
+    steps_per_epoch = 25  # 25 gradient steps per epoch to guarantee strong convergence!
+    for epoch in range(1, 501):
+        unet_atom.train(); unet_res.train()
+        epoch_loss = 0.0
+        for _ in range(steps_per_epoch):
+            samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
+            inputs = torch.stack([s[0] for s in samples]).unsqueeze(1).to(device)
+            target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1).to(device)
+            target_res = torch.stack([s[2] for s in samples]).long().to(device)
+            
+            inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)
+            
+            opt_unet.zero_grad()
+            pred_atom, ds_atom = unet_atom(inputs, return_ds=True)
+            pred_res, ds_res = unet_res(inputs, return_ds=True)
+            
+            loss = compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res)
+            loss.backward()
+            opt_unet.step()
+            epoch_loss += loss.item()
+        epoch_loss /= steps_per_epoch
+        
+        # Periodic evaluation & clean printing
+        if epoch % 50 == 0 or epoch == 1:
+            unet_atom.eval(); unet_res.eval()
+            with torch.no_grad():
+                val_loss = 0.0
+                val_steps = 5
+                for _ in range(val_steps):
+                    val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
+                    val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1).to(device)
+                    val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1).to(device)
+                    val_target_res = torch.stack([s[2] for s in val_samples]).long().to(device)
+                    
+                    val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)
+                    val_pred_res, val_ds_res = unet_res(val_inputs, return_ds=True)
+                    val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res).item()
+                val_loss /= val_steps
+                
+            print(f"U-Net Epoch {epoch:03d}/500 | Train Loss: {epoch_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    # --------------------------------------------------------------------------
+    # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION (LECTURE 3)
+    # --------------------------------------------------------------------------
+    print("\n" + "="*70)
+    print(" PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION ")
+    print("="*70)
+
+    pairformer = PairformerContactPredictor(
+        vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
+    ).to(device)
+    opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
+    criterion_pf = nn.BCEWithLogitsLoss()
+
+    pf_data = list(all_structures.items())
+    pf_train = pf_data[:-2]
+    pf_val = pf_data[-2:]
+
+    # Train 200 epochs on contact maps (evaluating validation and printing every 50 epochs)
+    for epoch in range(1, 201):
+        pairformer.train()
+        train_loss = 0.0
+        for pid, s in pf_train:
+            tokens = s["s_seq"].unsqueeze(0).to(device)
+            coords = s["s_coords"].to(device)
+            dist = torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            target_contacts = (dist < CONTACT_THRESHOLD).float().unsqueeze(0)
+            
+            opt_pf.zero_grad()
+            pred_contacts = pairformer(tokens)
+            loss = criterion_pf(pred_contacts, target_contacts)
+            loss.backward()
+            opt_pf.step()
+            train_loss += loss.item()
+        train_loss /= len(pf_train)
+            
+        # Periodic evaluation & clean printing
+        if epoch % 50 == 0 or epoch == 1:
+            pairformer.eval()
+            with torch.no_grad():
+                val_loss = 0.0
+                for pid, s in pf_val:
+                    tokens = s["s_seq"].unsqueeze(0).to(device)
+                    coords = s["s_coords"].to(device)
+                    dist = torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+                    target_contacts = (dist < CONTACT_THRESHOLD).float().unsqueeze(0)
+                    
+                    pred_contacts = pairformer(tokens)
+                    val_loss += criterion_pf(pred_contacts, target_contacts).item()
+                val_loss /= len(pf_val)
+                
+            print(f"Pairformer Epoch {epoch:03d}/200 | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    # Visual check on the first target with shape-watching enabled
+    pairformer.eval()
+    with torch.no_grad():
+        vis_key = list(all_structures.keys())[0]
+        vis_s = all_structures[vis_key]
+        vis_tokens = vis_s["s_seq"].unsqueeze(0).to(device)
+        vis_pred = torch.sigmoid(pairformer(vis_tokens, shape_watch=True)).squeeze(0).cpu()
+        vis_gt = (torch.cdist(vis_s["s_coords"].unsqueeze(0), vis_s["s_coords"].unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float()
+        print(f"\nCompleted run. Contact Map ASCII Visual check for {vis_key.upper()}:")
+        print_ascii_contact_map(vis_gt, vis_pred, threshold=0.5)
+
+    print("\nLectures 2 & 3 compiled and executed successfully in active Google Colab mode!")

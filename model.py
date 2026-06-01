@@ -479,79 +479,42 @@ class InterMultiplicativeUpdate(nn.Module):
         return self.lin_out(self.ln_out(out))
 
 
-class ResidueRowAttentionWithPairBias(nn.Module):
-    def __init__(self, c_pz: int, c_z: int, c_hidden: int, n_heads: int = 4):
+class JointAttentionWithPairBias(nn.Module):
+    def __init__(self, c_pz: int, c_bias: int, c_hidden: int, n_heads: int = 4, along_dim: int = -2):
         super().__init__()
         self.n_heads = n_heads
         self.d_k = c_hidden // n_heads
+        self.along_dim = along_dim  # -2: row (residue), -3: column (point)
         self.ln_pz = nn.LayerNorm(c_pz)
-        self.ln_z = nn.LayerNorm(c_z)
+        self.ln_bias = nn.LayerNorm(c_bias)
         
         self.proj_q = nn.Linear(c_pz, c_hidden, bias=False)
         self.proj_k = nn.Linear(c_pz, c_hidden, bias=False)
         self.proj_v = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_bias = nn.Linear(c_z, n_heads, bias=False)
+        self.proj_bias = nn.Linear(c_bias, n_heads, bias=False)
         self.proj_gate = nn.Linear(c_pz, c_hidden)
         self.proj_out = nn.Linear(c_hidden, c_pz)
 
-    def forward(self, pz: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        # pz: [B, N_point, N_res, c_pz], z: [B, N_res, N_res, c_z]
+    def forward(self, pz: torch.Tensor, bias_tensor: torch.Tensor) -> torch.Tensor:
         B, P, R, _ = pz.shape
         H = self.n_heads
-        
         pz_norm = self.ln_pz(pz)
         
-        q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4) # [B, P, H, R, d_k]
-        k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4)
-        v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4)
+        perm = (0, 1, 3, 2, 4) if self.along_dim == -2 else (0, 2, 3, 1, 4)
+        perm_out = (0, 1, 3, 2, 4) if self.along_dim == -2 else (0, 3, 1, 2, 4)
         
-        bias = self.proj_bias(self.ln_z(z)).permute(0, 3, 1, 2).unsqueeze(1) # [B, 1, H, R, R]
+        q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
+        k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
+        v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
         
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5) # [B, P, H, R, R]
+        bias = self.proj_bias(self.ln_bias(bias_tensor)).permute(0, 3, 1, 2).unsqueeze(1)
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
         attn_probs = F.softmax(logits + bias, dim=-1)
         
-        out = torch.matmul(attn_probs, v) # [B, P, H, R, d_k]
-        gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4))
+        out = torch.matmul(attn_probs, v)
+        gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(*perm))
         
-        out = (out * gate).permute(0, 1, 3, 2, 5).contiguous().view(B, P, R, c_hidden)
-        return self.proj_out(out)
-
-
-class PointColumnAttentionWithPairBias(nn.Module):
-    def __init__(self, c_pz: int, c_p: int, c_hidden: int, n_heads: int = 4):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_k = c_hidden // n_heads
-        self.ln_pz = nn.LayerNorm(c_pz)
-        self.ln_p = nn.LayerNorm(c_p)
-        
-        self.proj_q = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_k = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_v = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_bias = nn.Linear(c_p, n_heads, bias=False)
-        self.proj_gate = nn.Linear(c_pz, c_hidden)
-        self.proj_out = nn.Linear(c_hidden, c_pz)
-
-    def forward(self, pz: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        # pz: [B, N_point, N_res, c_pz], p: [B, N_point, N_point, c_p]
-        B, P, R, _ = pz.shape
-        H = self.n_heads
-        
-        pz_norm = self.ln_pz(pz)
-        
-        q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4) # [B, R, H, P, d_k]
-        k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4)
-        v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4)
-        
-        bias = self.proj_bias(self.ln_p(p)).permute(0, 3, 1, 2).unsqueeze(1) # [B, 1, H, P, P]
-        
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5) # [B, R, H, P, P]
-        attn_probs = F.softmax(logits + bias, dim=-1)
-        
-        out = torch.matmul(attn_probs, v) # [B, R, H, P, d_k]
-        gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4))
-        
-        out = (out * gate).permute(0, 3, 1, 2, 5).contiguous().view(B, P, R, c_hidden)
+        out = (out * gate).permute(*perm_out).contiguous().view(B, P, R, -1)
         return self.proj_out(out)
 
 
@@ -578,8 +541,6 @@ class EMOuterProductMean(nn.Module):
         self.lin_out = nn.Linear(c_hidden ** 2, c_z)
 
     def forward(self, m: torch.Tensor) -> torch.Tensor:
-        # m: [B, N_seq, N_res, c_m]
-        # output: [B, N_res, N_res, c_z]
         m_norm = self.ln(m)
         a = self.lin1(m_norm)
         b = self.lin2(m_norm)
@@ -597,8 +558,8 @@ class EMPairformerBlock(nn.Module):
         self.inter_outgoing = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
         self.inter_incoming = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
         
-        self.residue_row_attn = ResidueRowAttentionWithPairBias(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads)
-        self.point_column_attn = PointColumnAttentionWithPairBias(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads)
+        self.residue_row_attn = JointAttentionWithPairBias(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads, along_dim=-2)
+        self.point_column_attn = JointAttentionWithPairBias(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads, along_dim=-3)
         self.pz_transition = PointResidueTransition(c_pz)
         
         self.outer_row_opm = EMOuterProductMean(c_pz, c_z, c_hidden=16)
@@ -729,8 +690,8 @@ if __name__ == "__main__":
     print("="*70)
 
     K_FOLDS = 5
-    NUM_EPOCHS = 100
-    steps_per_epoch = 25
+    NUM_EPOCHS = 1 if device.type == "cpu" else 100
+    steps_per_epoch = 1 if device.type == "cpu" else 25
     MATCHING_RADIUS = 1.5
     spacing = DEFAULT_BOX_SIZE / (GRID_SIZE - 1)
 
@@ -766,6 +727,15 @@ if __name__ == "__main__":
         criterion_atom = BCEDiceLoss()
         criterion_res = nn.CrossEntropyLoss(ignore_index=0)
 
+        def compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res):
+            loss_atom_main = criterion_atom(pred_atom, target_atoms)
+            loss_res_main = criterion_res(pred_res, target_res)
+            target_atoms_ds = F.max_pool3d(target_atoms, kernel_size=2, stride=2)
+            target_res_ds = F.max_pool3d(target_res.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()
+            loss_atom_ds = criterion_atom(ds_atom, target_atoms_ds)
+            loss_res_ds = criterion_res(ds_res, target_res_ds)
+            return loss_atom_main + loss_res_main + 0.5 * (loss_atom_ds + loss_res_ds)
+
         best_val_loss = float('inf')
         best_atom_state = None
         best_res_state = None
@@ -797,7 +767,7 @@ if __name__ == "__main__":
                 unet_atom.eval(); unet_res.eval()
                 with torch.no_grad():
                     val_loss = 0.0
-                    val_steps = 5
+                    val_steps = 1 if device.type == "cpu" else 5
                     for _ in range(val_steps):
                         val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
                         val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1).to(device)
@@ -827,16 +797,12 @@ if __name__ == "__main__":
         peak_finder = BatchedMeanShiftPeakFinder3D().to(device)
         
         fold_pdb_results = []
-        num_test_crops = 10  # 10 random crops per unseen test target
+        num_test_crops = 1 if device.type == "cpu" else 10  # 10 random crops per unseen test target
         
         for pid in test_pids:
             # Single PDB subset
             test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
-            
-            pid_gt_atoms = 0
-            pid_matched_atoms = 0
-            pid_correct_residues = 0
-            pid_resolved_peaks = 0
+            pid_gt_atoms, pid_matched_atoms, pid_correct_residues, pid_resolved_peaks = 0, 0, 0, 0
             
             with torch.no_grad():
                 for _ in range(num_test_crops):
@@ -846,40 +812,26 @@ if __name__ == "__main__":
                     test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
                     
                     pred_density = F.relu(unet_atom(test_in_batch))
-                    pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+                    pred_coords, _, pred_mask = peak_finder(pred_density)
                     pred_res_logits = unet_res(test_in_batch)
                     
                     pred_coords = pred_coords[0].cpu()
-                    pred_mask = pred_mask[0].cpu()
-                    
-                    num_pred_peaks = pred_mask.sum().item()
-                    num_gt_peaks = len(gt_coords)
+                    num_pred_peaks = pred_mask[0].sum().item()
                     
                     pid_resolved_peaks += num_pred_peaks
-                    pid_gt_atoms += num_gt_peaks
+                    pid_gt_atoms += len(gt_coords)
                     
-                    matched_count = 0
-                    correct_res_count = 0
-                    
-                    for j, gt_c in enumerate(gt_coords):
-                        gt_res_idx = gt_res_indices[j].item()
-                        if num_pred_peaks > 0:
-                            distances = torch.norm(pred_coords[:num_pred_peaks] - gt_c.cpu(), dim=-1)
-                            min_dist, min_idx = torch.min(distances, dim=0)
-                            if min_dist.item() <= MATCHING_RADIUS:
-                                matched_count += 1
-                                
-                                p_coord = pred_coords[min_idx.item()]
-                                grid_idx = torch.round(p_coord / spacing).long()
-                                grid_idx = torch.clamp(grid_idx, 0, GRID_SIZE - 1)
-                                
+                    if num_pred_peaks > 0 and len(gt_coords) > 0:
+                        dists = torch.cdist(gt_coords.cpu(), pred_coords[:num_pred_peaks])
+                        min_dists, min_idxs = torch.min(dists, dim=-1)
+                        for j, (dist, idx) in enumerate(zip(min_dists, min_idxs)):
+                            if dist.item() <= MATCHING_RADIUS:
+                                pid_matched_atoms += 1
+                                p_coord = pred_coords[idx.item()]
+                                grid_idx = torch.clamp(torch.round(p_coord / spacing).long(), 0, GRID_SIZE - 1)
                                 logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
-                                pred_class = torch.argmax(logits[1:]).item() + 1
-                                if pred_class == gt_res_idx:
-                                    correct_res_count += 1
-                                    
-                    pid_matched_atoms += matched_count
-                    pid_correct_residues += correct_res_count
+                                if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[j].item():
+                                    pid_correct_residues += 1
             
             avg_peaks_per_crop = pid_resolved_peaks / num_test_crops
             recovery_pct = (pid_matched_atoms / pid_gt_atoms) * 100 if pid_gt_atoms > 0 else 0.0
@@ -888,13 +840,9 @@ if __name__ == "__main__":
             print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Classification: {class_pct:.1f}%")
             
             result_entry = {
-                "fold": fold_idx + 1,
-                "pid": pid.upper(),
-                "avg_peaks": avg_peaks_per_crop,
-                "gt_atoms": pid_gt_atoms,
-                "matched_atoms": pid_matched_atoms,
-                "recovery_pct": recovery_pct,
-                "class_pct": class_pct
+                "fold": fold_idx + 1, "pid": pid.upper(), "avg_peaks": avg_peaks_per_crop,
+                "gt_atoms": pid_gt_atoms, "matched_atoms": pid_matched_atoms,
+                "recovery_pct": recovery_pct, "class_pct": class_pct
             }
             fold_pdb_results.append(result_entry)
             all_folds_pdb_results.append(result_entry)
@@ -904,12 +852,12 @@ if __name__ == "__main__":
             global_correct_residues += pid_correct_residues
             global_resolved_peaks += pid_resolved_peaks
             global_num_crops += num_test_crops
-
+ 
         # Free VRAM memory to prevent leaks on Colab
         del unet_atom, unet_res, opt_unet
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
+ 
     # --------------------------------------------------------------------------
     # FINAL CONSOLIDATED CROSS-VALIDATION REPORT
     # --------------------------------------------------------------------------
@@ -928,37 +876,38 @@ if __name__ == "__main__":
     
     print(f" {'OVERALL':<7} | {'ALL':<7} | {global_avg_peaks:<13.1f} | {global_gt_atoms:<11} | {global_recovery:<10.1f}% | {global_classification:<16.1f}%")
     print("="*85 + "\n")
-
+ 
     # --------------------------------------------------------------------------
     # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION (LECTURE 3)
     # --------------------------------------------------------------------------
     print("\n" + "="*70)
     print(" PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION ")
     print("="*70)
-
+ 
     pairformer = PairformerContactPredictor(
         vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
     ).to(device)
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
     criterion_pf = nn.BCEWithLogitsLoss()
-
-    pf_data = list(all_structures.items())
-    pf_train = pf_data[:-2]
-    pf_val = pf_data[-2:]
-
-    # Train 200 epochs on contact maps (evaluating validation and printing every 50 epochs)
-    for epoch in range(1, 201):
+ 
+    # Precompute static target contacts to optimize speed and reduce lines
+    pf_dataset = []
+    for pid, s in all_structures.items():
+        tokens = s["s_seq"].unsqueeze(0).to(device)
+        coords = s["s_coords"].to(device)
+        target = (torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float().unsqueeze(0)
+        pf_dataset.append((tokens, target))
+    pf_train = pf_dataset[:-2]
+    pf_val = pf_dataset[-2:]
+ 
+    # Train 200 epochs on contact maps (scaled down on CPU)
+    num_pf_epochs = 2 if device.type == "cpu" else 200
+    for epoch in range(1, num_pf_epochs + 1):
         pairformer.train()
         train_loss = 0.0
-        for pid, s in pf_train:
-            tokens = s["s_seq"].unsqueeze(0).to(device)
-            coords = s["s_coords"].to(device)
-            dist = torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
-            target_contacts = (dist < CONTACT_THRESHOLD).float().unsqueeze(0)
-            
+        for tokens, target in pf_train:
             opt_pf.zero_grad()
-            pred_contacts = pairformer(tokens)
-            loss = criterion_pf(pred_contacts, target_contacts)
+            loss = criterion_pf(pairformer(tokens), target)
             loss.backward()
             opt_pf.step()
             train_loss += loss.item()
@@ -968,19 +917,9 @@ if __name__ == "__main__":
         if epoch % 50 == 0 or epoch == 1:
             pairformer.eval()
             with torch.no_grad():
-                val_loss = 0.0
-                for pid, s in pf_val:
-                    tokens = s["s_seq"].unsqueeze(0).to(device)
-                    coords = s["s_coords"].to(device)
-                    dist = torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
-                    target_contacts = (dist < CONTACT_THRESHOLD).float().unsqueeze(0)
-                    
-                    pred_contacts = pairformer(tokens)
-                    val_loss += criterion_pf(pred_contacts, target_contacts).item()
-                val_loss /= len(pf_val)
-                
+                val_loss = sum(criterion_pf(pairformer(tok), tar).item() for tok, tar in pf_val) / len(pf_val)
             print(f"Pairformer Epoch {epoch:03d}/200 | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
+ 
     # Visual check on the first target with shape-watching enabled
     pairformer.eval()
     with torch.no_grad():
@@ -998,14 +937,8 @@ if __name__ == "__main__":
     # Shape watcher unit tests for the EM-Pairformer (The Karpathy Touch!)
     def run_em_pairformer_shape_watcher_demo():
         print("\n[Shape Watcher] Initializing EM-Pairformer Demo...")
-        B = 1
-        N_res = 20
-        N_point = 15
-        
-        c_s = 64
-        c_z = 32
-        c_pz = 32
-        c_p = 32
+        B, N_res, N_point = 1, 20, 15
+        c_s, c_z, c_pz, c_p = 64, 32, 32, 32
         
         # 1. Mock inputs matching physical coordinates and densities
         vocab_size = len(RESIDUE_MAP)
@@ -1062,5 +995,5 @@ if __name__ == "__main__":
         print("  Mathematics and dimensions verified successfully!")
         
     run_em_pairformer_shape_watcher_demo()
-
+ 
     print("\nLectures 2 & 3 compiled and executed successfully in active Google Colab mode!")

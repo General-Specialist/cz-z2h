@@ -441,6 +441,217 @@ def print_ascii_contact_map(gt: torch.Tensor, pred: torch.Tensor, threshold: flo
 
 
 # ==============================================================================
+# SECTION 4B: THE EM-PAIRFORMER ARCHITECTURE (CryoZeta)
+# ==============================================================================
+
+class InterMultiplicativeUpdate(nn.Module):
+    def __init__(self, c_z: int, c_p: int, c_hidden: int, c_pz: int, outgoing: bool = True):
+        super().__init__()
+        self.outgoing = outgoing
+        self.ln_p = nn.LayerNorm(c_p)
+        self.ln_z = nn.LayerNorm(c_z)
+        self.ln_out = nn.LayerNorm(c_hidden)
+        
+        self.lin_p_proj = nn.Linear(c_p, c_hidden)
+        self.lin_z_proj = nn.Linear(c_z, c_hidden)
+        self.lin_p_gate = nn.Linear(c_p, c_hidden)
+        self.lin_z_gate = nn.Linear(c_z, c_hidden)
+        self.lin_out = nn.Linear(c_hidden, c_pz)
+
+    def forward(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        # z: [B, N_res, N_res, c_z], p: [B, N_point, N_point, c_p]
+        p_norm = self.ln_p(p)
+        z_norm = self.ln_z(z)
+        
+        x_p = torch.sigmoid(self.lin_p_gate(p_norm)) * self.lin_p_proj(p_norm)
+        x_z = torch.sigmoid(self.lin_z_gate(z_norm)) * self.lin_z_proj(z_norm)
+        
+        if self.outgoing:
+            # sum over intermediate connections to find outgoing paths (dim -2)
+            z_p = x_p.sum(dim=-2) # [B, N_point, c_hidden]
+            z_z = x_z.sum(dim=-2) # [B, N_res, c_hidden]
+        else:
+            # incoming paths (dim -3)
+            z_p = x_p.sum(dim=-3) # [B, N_point, c_hidden]
+            z_z = x_z.sum(dim=-3) # [B, N_res, c_hidden]
+            
+        out = torch.einsum("b p h, b r h -> b p r h", z_p, z_z)
+        return self.lin_out(self.ln_out(out))
+
+
+class ResidueRowAttentionWithPairBias(nn.Module):
+    def __init__(self, c_pz: int, c_z: int, c_hidden: int, n_heads: int = 4):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_k = c_hidden // n_heads
+        self.ln_pz = nn.LayerNorm(c_pz)
+        self.ln_z = nn.LayerNorm(c_z)
+        
+        self.proj_q = nn.Linear(c_pz, c_hidden, bias=False)
+        self.proj_k = nn.Linear(c_pz, c_hidden, bias=False)
+        self.proj_v = nn.Linear(c_pz, c_hidden, bias=False)
+        self.proj_bias = nn.Linear(c_z, n_heads, bias=False)
+        self.proj_gate = nn.Linear(c_pz, c_hidden)
+        self.proj_out = nn.Linear(c_hidden, c_pz)
+
+    def forward(self, pz: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # pz: [B, N_point, N_res, c_pz], z: [B, N_res, N_res, c_z]
+        B, P, R, _ = pz.shape
+        H = self.n_heads
+        
+        pz_norm = self.ln_pz(pz)
+        
+        q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4) # [B, P, H, R, d_k]
+        k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4)
+        v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4)
+        
+        bias = self.proj_bias(self.ln_z(z)).permute(0, 3, 1, 2).unsqueeze(1) # [B, 1, H, R, R]
+        
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5) # [B, P, H, R, R]
+        attn_probs = F.softmax(logits + bias, dim=-1)
+        
+        out = torch.matmul(attn_probs, v) # [B, P, H, R, d_k]
+        gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(0, 1, 3, 2, 4))
+        
+        out = (out * gate).permute(0, 1, 3, 2, 5).contiguous().view(B, P, R, c_hidden)
+        return self.proj_out(out)
+
+
+class PointColumnAttentionWithPairBias(nn.Module):
+    def __init__(self, c_pz: int, c_p: int, c_hidden: int, n_heads: int = 4):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_k = c_hidden // n_heads
+        self.ln_pz = nn.LayerNorm(c_pz)
+        self.ln_p = nn.LayerNorm(c_p)
+        
+        self.proj_q = nn.Linear(c_pz, c_hidden, bias=False)
+        self.proj_k = nn.Linear(c_pz, c_hidden, bias=False)
+        self.proj_v = nn.Linear(c_pz, c_hidden, bias=False)
+        self.proj_bias = nn.Linear(c_p, n_heads, bias=False)
+        self.proj_gate = nn.Linear(c_pz, c_hidden)
+        self.proj_out = nn.Linear(c_hidden, c_pz)
+
+    def forward(self, pz: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        # pz: [B, N_point, N_res, c_pz], p: [B, N_point, N_point, c_p]
+        B, P, R, _ = pz.shape
+        H = self.n_heads
+        
+        pz_norm = self.ln_pz(pz)
+        
+        q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4) # [B, R, H, P, d_k]
+        k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4)
+        v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4)
+        
+        bias = self.proj_bias(self.ln_p(p)).permute(0, 3, 1, 2).unsqueeze(1) # [B, 1, H, P, P]
+        
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5) # [B, R, H, P, P]
+        attn_probs = F.softmax(logits + bias, dim=-1)
+        
+        out = torch.matmul(attn_probs, v) # [B, R, H, P, d_k]
+        gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(0, 2, 3, 1, 4))
+        
+        out = (out * gate).permute(0, 3, 1, 2, 5).contiguous().view(B, P, R, c_hidden)
+        return self.proj_out(out)
+
+
+class PointResidueTransition(nn.Module):
+    def __init__(self, c_pz: int, n: int = 4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(c_pz),
+            nn.Linear(c_pz, n * c_pz),
+            nn.ReLU(),
+            nn.Linear(n * c_pz, c_pz)
+        )
+
+    def forward(self, pz: torch.Tensor) -> torch.Tensor:
+        return self.net(pz)
+
+
+class EMOuterProductMean(nn.Module):
+    def __init__(self, c_m: int, c_z: int, c_hidden: int = 16):
+        super().__init__()
+        self.ln = nn.LayerNorm(c_m)
+        self.lin1 = nn.Linear(c_m, c_hidden)
+        self.lin2 = nn.Linear(c_m, c_hidden)
+        self.lin_out = nn.Linear(c_hidden ** 2, c_z)
+
+    def forward(self, m: torch.Tensor) -> torch.Tensor:
+        # m: [B, N_seq, N_res, c_m]
+        # output: [B, N_res, N_res, c_z]
+        m_norm = self.ln(m)
+        a = self.lin1(m_norm)
+        b = self.lin2(m_norm)
+        outer = torch.einsum("b s i c, b s j d -> b i j c d", a, b).flatten(start_dim=-2)
+        out = self.lin_out(outer) / (m.shape[1] + 1e-8)
+        return out
+
+
+class EMPairformerBlock(nn.Module):
+    def __init__(self, c_s: int, c_z: int, c_pz: int, c_p: int, n_heads: int = 4):
+        super().__init__()
+        self.tri_mul_out = TriangleMultiplicativeUpdate(c_z)
+        self.tri_mul_in = TriangleMultiplicativeUpdate(c_z)
+        
+        self.inter_outgoing = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
+        self.inter_incoming = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
+        
+        self.residue_row_attn = ResidueRowAttentionWithPairBias(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads)
+        self.point_column_attn = PointColumnAttentionWithPairBias(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads)
+        self.pz_transition = PointResidueTransition(c_pz)
+        
+        self.outer_row_opm = EMOuterProductMean(c_pz, c_z, c_hidden=16)
+        self.outer_col_opm = EMOuterProductMean(c_pz, c_p, c_hidden=16)
+        
+        self.transition_z = nn.Sequential(
+            nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
+        )
+        self.c_s = c_s
+        if c_s > 0:
+            self.attn = AttentionPairBias(c_s, c_z, n_heads)
+            self.transition_s = nn.Sequential(
+                nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
+            )
+
+    def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch: bool = False) -> tuple:
+        if shape_watch:
+            print(f"    [Shape Watcher - EMPairformerBlock Input]\n      s={list(s.shape) if s is not None else None}, z={list(z.shape)}, pz={list(pz.shape)}, p={list(p.shape)}")
+            
+        z = z + self.tri_mul_out(z)
+        z = z + self.tri_mul_in(z)
+        
+        pz = pz + self.inter_outgoing(z, p)
+        pz = pz + self.inter_incoming(z, p)
+        pz = pz + self.residue_row_attn(pz, z)
+        pz = pz + self.point_column_attn(pz, p)
+        pz = pz + self.pz_transition(pz)
+        
+        # update z from pz (averaging over point axis)
+        z = z + self.outer_row_opm(pz)
+        # update p from pz (averaging over residue axis)
+        p = p + self.outer_col_opm(pz.transpose(1, 2))
+        z = z + self.transition_z(z)
+        
+        if self.c_s > 0 and s is not None:
+            s = s + self.attn(s, z, shape_watch=shape_watch)
+            s = s + self.transition_s(s)
+            
+        return s, z, pz, p
+
+
+class EMPairformerStack(nn.Module):
+    def __init__(self, c_s: int, c_z: int, c_pz: int, c_p: int, n_blocks: int = 3, n_heads: int = 4):
+        super().__init__()
+        self.blocks = nn.ModuleList([EMPairformerBlock(c_s, c_z, c_pz, c_p, n_heads) for _ in range(n_blocks)])
+
+    def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch_first: bool = False) -> tuple:
+        for i, block in enumerate(self.blocks):
+            s, z, pz, p = block(s, z, pz, p, shape_watch=(shape_watch_first and i == 0))
+        return s, z, pz, p
+
+
+# ==============================================================================
 # SECTION 5: K-FOLD AND DUAL GOOGLE COLAB TRAINING PIPELINE
 # ==============================================================================
 
@@ -780,5 +991,76 @@ if __name__ == "__main__":
         vis_gt = (torch.cdist(vis_s["s_coords"].unsqueeze(0), vis_s["s_coords"].unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float()
         print(f"\nCompleted run. Contact Map ASCII Visual check for {vis_key.upper()}:")
         print_ascii_contact_map(vis_gt, vis_pred, threshold=0.5)
+    print("\n" + "="*70)
+    print(" PIPELINE 3: MATHEMATICAL DYNAMIC SHAPE WATCHING OF CRYOMAP EM-PAIRFORMER ")
+    print("="*70)
+    
+    # Shape watcher unit tests for the EM-Pairformer (The Karpathy Touch!)
+    def run_em_pairformer_shape_watcher_demo():
+        print("\n[Shape Watcher] Initializing EM-Pairformer Demo...")
+        B = 1
+        N_res = 20
+        N_point = 15
+        
+        c_s = 64
+        c_z = 32
+        c_pz = 32
+        c_p = 32
+        
+        # 1. Mock inputs matching physical coordinates and densities
+        vocab_size = len(RESIDUE_MAP)
+        mock_tokens = torch.randint(1, vocab_size, (B, N_res), device=device)
+        mock_p_coords = torch.rand(B, N_point, 3, device=device) * DEFAULT_BOX_SIZE
+        mock_p_densities = torch.rand(B, N_point, device=device)
+        mock_res_coords = torch.rand(B, N_res, 3, device=device) * DEFAULT_BOX_SIZE
+        
+        # 2. Build physical representation matrices using RBF
+        def mock_rbf_expansion(dists: torch.Tensor, num_centers: int = 32) -> torch.Tensor:
+            centers = torch.linspace(0.0, DEFAULT_BOX_SIZE, num_centers, device=dists.device)
+            widths = DEFAULT_BOX_SIZE / num_centers
+            return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)
+            
+        print("  Generating geometric representation matrices...")
+        dist_pp = torch.cdist(mock_p_coords, mock_p_coords)
+        dist_pr = torch.cdist(mock_p_coords, mock_res_coords)
+        
+        p_geom = mock_rbf_expansion(dist_pp, num_centers=c_p)
+        pz_geom = mock_rbf_expansion(dist_pr, num_centers=c_pz)
+        
+        # Inject density features into point representations
+        proj_density = nn.Linear(1, c_p).to(device)
+        p = p_geom + proj_density(mock_p_densities.unsqueeze(-1)).unsqueeze(1)
+        pz = pz_geom
+        
+        # Embed sequence and initialize residue pairs
+        embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0).to(device)
+        initializer = SequenceToPairInitializer(c_s, c_z, MAX_REL_POS).to(device)
+        
+        s = embedding(mock_tokens)
+        z = initializer(s)
+        
+        # 3. Instantiate EMPairformerStack
+        print("  Instantiating EMPairformerStack...")
+        em_pairformer = EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4).to(device)
+        em_pairformer.eval()
+        
+        # 4. Forward pass under dynamic Shape Watcher
+        print("  Running EM-Pairformer forward pass:")
+        with torch.no_grad():
+            s_out, z_out, pz_out, p_out = em_pairformer(s, z, pz, p, shape_watch_first=True)
+            
+        print("\n  [EM-Pairformer Output Shapes Verification]")
+        print(f"    Sequence Feature (s): {list(s_out.shape)} (Expected: [1, 20, 64])")
+        print(f"    Residue-Residue (z):  {list(z_out.shape)} (Expected: [1, 20, 20, 32])")
+        print(f"    Point-Residue (pz):   {list(pz_out.shape)} (Expected: [1, 15, 20, 32])")
+        print(f"    Point-Point (p):      {list(p_out.shape)} (Expected: [1, 15, 15, 32])")
+        
+        assert s_out.shape == (B, N_res, c_s)
+        assert z_out.shape == (B, N_res, N_res, c_z)
+        assert pz_out.shape == (B, N_point, N_res, c_pz)
+        assert p_out.shape == (B, N_point, N_point, c_p)
+        print("  Mathematics and dimensions verified successfully!")
+        
+    run_em_pairformer_shape_watcher_demo()
 
     print("\nLectures 2 & 3 compiled and executed successfully in active Google Colab mode!")

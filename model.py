@@ -93,7 +93,7 @@ def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, retu
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
 
     density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=DEFAULT_RADIUS)
-    
+
     out_density = F.relu(density + torch.randn_like(density) * noise)
     if return_coords:
         return out_density, binary_grid, residue_grid, cropped_coords, cropped_res
@@ -221,7 +221,8 @@ class UNet3D(nn.Module):
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, C, X, Y, Z = density.shape
+        B = density.shape[0]
+        X = density.shape[2]  # Handles 5D shape [B, 1, X, X, X]
         M = DEFAULT_MAX_PEAKS
         spacing = DEFAULT_BOX_SIZE / (X - 1)
 
@@ -235,31 +236,92 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         out_vals = torch.zeros(B, M, device=density.device)
         out_mask = torch.zeros(B, M, dtype=torch.bool, device=density.device)
 
-        for b in range(B):
-            b_dens = density[b, 0]
-            b_peaks = peaks[b, 0].view(-1)
+        clash_limit_sq = CLASH_LIMIT ** 2
+        inv_two_bandwidth_sq = 1.0 / (2 * DEFAULT_PEAK_BANDWIDTH ** 2)
 
-            active_coords = grid[b_dens.view(-1) > DEFAULT_PEAK_THRESHOLD]
-            active_weights = b_dens[b_dens > DEFAULT_PEAK_THRESHOLD]
+        # ----------------------------------------------------------------------
+        # 1. Dynamic Batched Active Coordinate Padding
+        # ----------------------------------------------------------------------
+        active_mask = (density > DEFAULT_PEAK_THRESHOLD).view(B, -1)
+        num_active = active_mask.sum(dim=-1)
+        max_active = num_active.max().item()
 
-            seeds = grid[b_peaks][:M]
-            if len(seeds) == 0: continue
+        # ----------------------------------------------------------------------
+        # 2. Dynamic Batched Seed Padding
+        # ----------------------------------------------------------------------
+        peaks_mask = peaks.view(B, -1)
+        cum_sum_peaks = torch.cumsum(peaks_mask, dim=-1)
+        peaks_positions = (cum_sum_peaks * peaks_mask) - 1
+        
+        valid_peaks_mask = peaks_mask & (peaks_positions < M)
+        num_peaks = valid_peaks_mask.sum(dim=-1)
+        S_max = num_peaks.max().item()
 
-            for _ in range(DEFAULT_PEAK_ITERATIONS):
-                dists = torch.cdist(seeds, active_coords)
-                weights = torch.exp(-dists**2 / (2 * DEFAULT_PEAK_BANDWIDTH**2)) * active_weights
-                seeds = torch.matmul(weights, active_coords) / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        if max_active == 0 or S_max == 0:
+            return out_coords, out_vals, out_mask
 
-            keep = torch.ones(len(seeds), dtype=torch.bool, device=density.device)
-            for i in range(len(seeds)):
-                if not keep[i]: continue
-                keep[i+1:][torch.norm(seeds[i+1:] - seeds[i], dim=-1) < CLASH_LIMIT] = False
-            seeds = seeds[keep][:M]
+        # Populate padded active tensors
+        nz_active = torch.nonzero(active_mask)
+        pos_active = ((torch.cumsum(active_mask, dim=-1) * active_mask) - 1)[active_mask]
+        
+        padded_active_coords = torch.zeros(B, max_active, 3, device=density.device)
+        padded_active_weights = torch.zeros(B, max_active, device=density.device)
+        padded_active_coords[nz_active[:, 0], pos_active] = grid[nz_active[:, 1]]
+        padded_active_weights[nz_active[:, 0], pos_active] = density.view(B, -1)[active_mask]
 
-            n = len(seeds)
-            out_coords[b, :n] = seeds
-            out_vals[b, :n] = b_dens[(seeds / spacing).round().long().clamp(0, X-1).unbind(dim=-1)]
-            out_mask[b, :n] = True
+        # Populate padded seeds
+        nz_peaks = torch.nonzero(valid_peaks_mask)
+        pos_peaks = peaks_positions[valid_peaks_mask]
+        
+        padded_seeds = torch.zeros(B, S_max, 3, device=density.device)
+        padded_seeds[nz_peaks[:, 0], pos_peaks] = grid[nz_peaks[:, 1]]
+
+        # Keep track of active seed masks per batch element
+        valid_seed_mask = torch.arange(S_max, device=density.device).unsqueeze(0) < num_peaks.unsqueeze(1)
+        keep = valid_seed_mask.clone()
+
+        # ----------------------------------------------------------------------
+        # 3. Batched Mean-Shift Iteration (No Batch Loop)
+        # ----------------------------------------------------------------------
+        padded_active_sq = torch.sum(padded_active_coords ** 2, dim=-1, keepdim=True).transpose(-1, -2)
+        for _ in range(DEFAULT_PEAK_ITERATIONS):
+            seeds_sq = torch.sum(padded_seeds ** 2, dim=-1, keepdim=True)
+            dot_product = torch.bmm(padded_seeds, padded_active_coords.transpose(-1, -2))
+            sq_dists = torch.clamp(seeds_sq + padded_active_sq - 2 * dot_product, min=0.0)
+
+            weights = torch.exp(-sq_dists * inv_two_bandwidth_sq) * padded_active_weights.unsqueeze(1)
+            padded_seeds = torch.bmm(weights, padded_active_coords) / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # ----------------------------------------------------------------------
+        # 4. Batched Clash Removal (Parallelized across Batch elements)
+        # ----------------------------------------------------------------------
+        for i in range(S_max):
+            if i == S_max - 1: break
+            seeds_i = padded_seeds[:, i:i+1]
+            seeds_rest = padded_seeds[:, i+1:]
+            
+            sq_dists = torch.sum((seeds_rest - seeds_i) ** 2, dim=-1)
+            clash = (sq_dists < clash_limit_sq) & keep[:, i:i+1]
+            keep[:, i+1:][clash] = False
+
+        # ----------------------------------------------------------------------
+        # 5. Pack Kept Seeds to Contiguous Output Tensors
+        # ----------------------------------------------------------------------
+        keep_cumsum = torch.cumsum(keep, dim=-1)
+        keep_positions = (keep_cumsum * keep) - 1
+        final_keep = keep & (keep_positions < M)
+
+        nz_final = torch.nonzero(final_keep)
+        b_final = nz_final[:, 0]
+        s_final = nz_final[:, 1]
+        pos_final = keep_positions[final_keep]
+
+        coords_final = padded_seeds[b_final, s_final]
+        coords_grid = (coords_final / spacing).round().long().clamp(0, X-1)
+
+        out_coords[b_final, pos_final] = coords_final
+        out_vals[b_final, pos_final] = density[b_final, 0, coords_grid[:, 0], coords_grid[:, 1], coords_grid[:, 2]]
+        out_mask[b_final, pos_final] = True
 
         return out_coords, out_vals, out_mask
 
@@ -451,7 +513,7 @@ class InterMultiplicativeUpdate(nn.Module):
         self.ln_p = nn.LayerNorm(c_p)
         self.ln_z = nn.LayerNorm(c_z)
         self.ln_out = nn.LayerNorm(c_hidden)
-        
+
         self.lin_p_proj = nn.Linear(c_p, c_hidden)
         self.lin_z_proj = nn.Linear(c_z, c_hidden)
         self.lin_p_gate = nn.Linear(c_p, c_hidden)
@@ -462,10 +524,10 @@ class InterMultiplicativeUpdate(nn.Module):
         # z: [B, N_res, N_res, c_z], p: [B, N_point, N_point, c_p]
         p_norm = self.ln_p(p)
         z_norm = self.ln_z(z)
-        
+
         x_p = torch.sigmoid(self.lin_p_gate(p_norm)) * self.lin_p_proj(p_norm)
         x_z = torch.sigmoid(self.lin_z_gate(z_norm)) * self.lin_z_proj(z_norm)
-        
+
         if self.outgoing:
             # sum over intermediate connections to find outgoing paths (dim -2)
             z_p = x_p.sum(dim=-2) # [B, N_point, c_hidden]
@@ -474,7 +536,7 @@ class InterMultiplicativeUpdate(nn.Module):
             # incoming paths (dim -3)
             z_p = x_p.sum(dim=-3) # [B, N_point, c_hidden]
             z_z = x_z.sum(dim=-3) # [B, N_res, c_hidden]
-            
+
         out = torch.einsum("b p h, b r h -> b p r h", z_p, z_z)
         return self.lin_out(self.ln_out(out))
 
@@ -487,7 +549,7 @@ class JointAttentionWithPairBias(nn.Module):
         self.along_dim = along_dim  # -2: row (residue), -3: column (point)
         self.ln_pz = nn.LayerNorm(c_pz)
         self.ln_bias = nn.LayerNorm(c_bias)
-        
+
         self.proj_q = nn.Linear(c_pz, c_hidden, bias=False)
         self.proj_k = nn.Linear(c_pz, c_hidden, bias=False)
         self.proj_v = nn.Linear(c_pz, c_hidden, bias=False)
@@ -499,21 +561,21 @@ class JointAttentionWithPairBias(nn.Module):
         B, P, R, _ = pz.shape
         H = self.n_heads
         pz_norm = self.ln_pz(pz)
-        
+
         perm = (0, 1, 3, 2, 4) if self.along_dim == -2 else (0, 2, 3, 1, 4)
         perm_out = (0, 1, 3, 2, 4) if self.along_dim == -2 else (0, 3, 1, 2, 4)
-        
+
         q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
         k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
         v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
-        
+
         bias = self.proj_bias(self.ln_bias(bias_tensor)).permute(0, 3, 1, 2).unsqueeze(1)
         logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
         attn_probs = F.softmax(logits + bias, dim=-1)
-        
+
         out = torch.matmul(attn_probs, v)
         gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(*perm))
-        
+
         out = (out * gate).permute(*perm_out).contiguous().view(B, P, R, -1)
         return self.proj_out(out)
 
@@ -554,17 +616,17 @@ class EMPairformerBlock(nn.Module):
         super().__init__()
         self.tri_mul_out = TriangleMultiplicativeUpdate(c_z)
         self.tri_mul_in = TriangleMultiplicativeUpdate(c_z)
-        
+
         self.inter_outgoing = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
         self.inter_incoming = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
-        
+
         self.residue_row_attn = JointAttentionWithPairBias(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads, along_dim=-2)
         self.point_column_attn = JointAttentionWithPairBias(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads, along_dim=-3)
         self.pz_transition = PointResidueTransition(c_pz)
-        
+
         self.outer_row_opm = EMOuterProductMean(c_pz, c_z, c_hidden=16)
         self.outer_col_opm = EMOuterProductMean(c_pz, c_p, c_hidden=16)
-        
+
         self.transition_z = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
         )
@@ -578,26 +640,26 @@ class EMPairformerBlock(nn.Module):
     def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch: bool = False) -> tuple:
         if shape_watch:
             print(f"    [Shape Watcher - EMPairformerBlock Input]\n      s={list(s.shape) if s is not None else None}, z={list(z.shape)}, pz={list(pz.shape)}, p={list(p.shape)}")
-            
+
         z = z + self.tri_mul_out(z)
         z = z + self.tri_mul_in(z)
-        
+
         pz = pz + self.inter_outgoing(z, p)
         pz = pz + self.inter_incoming(z, p)
         pz = pz + self.residue_row_attn(pz, z)
         pz = pz + self.point_column_attn(pz, p)
         pz = pz + self.pz_transition(pz)
-        
+
         # update z from pz (averaging over point axis)
         z = z + self.outer_row_opm(pz)
         # update p from pz (averaging over residue axis)
         p = p + self.outer_col_opm(pz.transpose(1, 2))
         z = z + self.transition_z(z)
-        
+
         if self.c_s > 0 and s is not None:
             s = s + self.attn(s, z, shape_watch=shape_watch)
             s = s + self.transition_s(s)
-            
+
         return s, z, pz, p
 
 
@@ -630,15 +692,15 @@ def get_fold_split(folds: list[list], fold_idx: int) -> tuple[list, list, list]:
     k = len(folds)
     test_idx = fold_idx
     val_idx = (fold_idx + 1) % k
-    
+
     test_set = folds[test_idx]
     val_set = folds[val_idx]
-    
+
     train_set = []
     for idx in range(k):
         if idx != test_idx and idx != val_idx:
             train_set.extend(folds[idx])
-            
+
     return train_set, val_set, test_set
 
 
@@ -698,7 +760,7 @@ if __name__ == "__main__":
     # Initialize 5 folds on the 8 PDBs
     pdb_folds = get_k_folds(PDB_IDS, k=K_FOLDS, seed=RANDOM_SEED)
     all_folds_pdb_results = []
-    
+
     global_gt_atoms = 0
     global_matched_atoms = 0
     global_correct_residues = 0
@@ -749,19 +811,19 @@ if __name__ == "__main__":
                 inputs = torch.stack([s[0] for s in samples]).unsqueeze(1).to(device)
                 target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1).to(device)
                 target_res = torch.stack([s[2] for s in samples]).long().to(device)
-                
+
                 inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)
-                
+
                 opt_unet.zero_grad()
                 pred_atom, ds_atom = unet_atom(inputs, return_ds=True)
                 pred_res, ds_res = unet_res(inputs, return_ds=True)
-                
+
                 loss = compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res)
                 loss.backward()
                 opt_unet.step()
                 epoch_loss += loss.item()
             epoch_loss /= steps_per_epoch
-            
+
             # Periodic evaluation & clean printing
             if epoch % 50 == 0 or epoch == 1:
                 unet_atom.eval(); unet_res.eval()
@@ -773,14 +835,14 @@ if __name__ == "__main__":
                         val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1).to(device)
                         val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1).to(device)
                         val_target_res = torch.stack([s[2] for s in val_samples]).long().to(device)
-                        
+
                         val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)
                         val_pred_res, val_ds_res = unet_res(val_inputs, return_ds=True)
                         val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res).item()
                     val_loss /= val_steps
-                    
+
                 print(f"Fold {fold_idx + 1} | Epoch {epoch:03d}/100 | Train Loss: {epoch_loss:.4f} | Val Loss: {val_loss:.4f}")
-                
+
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_atom_state = {k: v.cpu() for k, v in unet_atom.state_dict().items()}
@@ -795,32 +857,32 @@ if __name__ == "__main__":
         print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
         unet_atom.eval(); unet_res.eval()
         peak_finder = BatchedMeanShiftPeakFinder3D().to(device)
-        
+
         fold_pdb_results = []
         num_test_crops = 1 if device.type == "cpu" else 10  # 10 random crops per unseen test target
-        
+
         for pid in test_pids:
             # Single PDB subset
             test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
             pid_gt_atoms, pid_matched_atoms, pid_correct_residues, pid_resolved_peaks = 0, 0, 0, 0
-            
+
             with torch.no_grad():
                 for _ in range(num_test_crops):
                     test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
                         test_target_structure, is_training=False, return_coords=True
                     )
                     test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
-                    
+
                     pred_density = F.relu(unet_atom(test_in_batch))
                     pred_coords, _, pred_mask = peak_finder(pred_density)
                     pred_res_logits = unet_res(test_in_batch)
-                    
+
                     pred_coords = pred_coords[0].cpu()
                     num_pred_peaks = pred_mask[0].sum().item()
-                    
+
                     pid_resolved_peaks += num_pred_peaks
                     pid_gt_atoms += len(gt_coords)
-                    
+
                     if num_pred_peaks > 0 and len(gt_coords) > 0:
                         dists = torch.cdist(gt_coords.cpu(), pred_coords[:num_pred_peaks])
                         min_dists, min_idxs = torch.min(dists, dim=-1)
@@ -832,13 +894,13 @@ if __name__ == "__main__":
                                 logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
                                 if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[j].item():
                                     pid_correct_residues += 1
-            
+
             avg_peaks_per_crop = pid_resolved_peaks / num_test_crops
             recovery_pct = (pid_matched_atoms / pid_gt_atoms) * 100 if pid_gt_atoms > 0 else 0.0
             class_pct = (pid_correct_residues / pid_matched_atoms) * 100 if pid_matched_atoms > 0 else 0.0
-            
+
             print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Classification: {class_pct:.1f}%")
-            
+
             result_entry = {
                 "fold": fold_idx + 1, "pid": pid.upper(), "avg_peaks": avg_peaks_per_crop,
                 "gt_atoms": pid_gt_atoms, "matched_atoms": pid_matched_atoms,
@@ -846,18 +908,18 @@ if __name__ == "__main__":
             }
             fold_pdb_results.append(result_entry)
             all_folds_pdb_results.append(result_entry)
-            
+
             global_gt_atoms += pid_gt_atoms
             global_matched_atoms += pid_matched_atoms
             global_correct_residues += pid_correct_residues
             global_resolved_peaks += pid_resolved_peaks
             global_num_crops += num_test_crops
- 
+
         # Free VRAM memory to prevent leaks on Colab
         del unet_atom, unet_res, opt_unet
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
- 
+
     # --------------------------------------------------------------------------
     # FINAL CONSOLIDATED CROSS-VALIDATION REPORT
     # --------------------------------------------------------------------------
@@ -869,27 +931,27 @@ if __name__ == "__main__":
     for res in all_folds_pdb_results:
         print(f"  {res['fold']:<3} | {res['pid']:<7} | {res['avg_peaks']:<13.1f} | {res['gt_atoms']:<11} | {res['recovery_pct']:<10.1f}% | {res['class_pct']:<16.1f}%")
     print("-" * 85)
-    
+
     global_avg_peaks = global_resolved_peaks / global_num_crops if global_num_crops > 0 else 0.0
     global_recovery = (global_matched_atoms / global_gt_atoms) * 100 if global_gt_atoms > 0 else 0.0
     global_classification = (global_correct_residues / global_matched_atoms) * 100 if global_matched_atoms > 0 else 0.0
-    
+
     print(f" {'OVERALL':<7} | {'ALL':<7} | {global_avg_peaks:<13.1f} | {global_gt_atoms:<11} | {global_recovery:<10.1f}% | {global_classification:<16.1f}%")
     print("="*85 + "\n")
- 
+
     # --------------------------------------------------------------------------
     # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION (LECTURE 3)
     # --------------------------------------------------------------------------
     print("\n" + "="*70)
     print(" PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION ")
     print("="*70)
- 
+
     pairformer = PairformerContactPredictor(
         vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
     ).to(device)
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
     criterion_pf = nn.BCEWithLogitsLoss()
- 
+
     # Precompute static target contacts to optimize speed and reduce lines
     pf_dataset = []
     for pid, s in all_structures.items():
@@ -899,7 +961,7 @@ if __name__ == "__main__":
         pf_dataset.append((tokens, target))
     pf_train = pf_dataset[:-2]
     pf_val = pf_dataset[-2:]
- 
+
     # Train 200 epochs on contact maps (scaled down on CPU)
     num_pf_epochs = 2 if device.type == "cpu" else 200
     for epoch in range(1, num_pf_epochs + 1):
@@ -912,14 +974,14 @@ if __name__ == "__main__":
             opt_pf.step()
             train_loss += loss.item()
         train_loss /= len(pf_train)
-            
+
         # Periodic evaluation & clean printing
         if epoch % 50 == 0 or epoch == 1:
             pairformer.eval()
             with torch.no_grad():
                 val_loss = sum(criterion_pf(pairformer(tok), tar).item() for tok, tar in pf_val) / len(pf_val)
             print(f"Pairformer Epoch {epoch:03d}/200 | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
- 
+
     # Visual check on the first target with shape-watching enabled
     pairformer.eval()
     with torch.no_grad():
@@ -933,67 +995,67 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print(" PIPELINE 3: MATHEMATICAL DYNAMIC SHAPE WATCHING OF CRYOMAP EM-PAIRFORMER ")
     print("="*70)
-    
+
     # Shape watcher unit tests for the EM-Pairformer (The Karpathy Touch!)
     def run_em_pairformer_shape_watcher_demo():
         print("\n[Shape Watcher] Initializing EM-Pairformer Demo...")
         B, N_res, N_point = 1, 20, 15
         c_s, c_z, c_pz, c_p = 64, 32, 32, 32
-        
+
         # 1. Mock inputs matching physical coordinates and densities
         vocab_size = len(RESIDUE_MAP)
         mock_tokens = torch.randint(1, vocab_size, (B, N_res), device=device)
         mock_p_coords = torch.rand(B, N_point, 3, device=device) * DEFAULT_BOX_SIZE
         mock_p_densities = torch.rand(B, N_point, device=device)
         mock_res_coords = torch.rand(B, N_res, 3, device=device) * DEFAULT_BOX_SIZE
-        
+
         # 2. Build physical representation matrices using RBF
         def mock_rbf_expansion(dists: torch.Tensor, num_centers: int = 32) -> torch.Tensor:
             centers = torch.linspace(0.0, DEFAULT_BOX_SIZE, num_centers, device=dists.device)
             widths = DEFAULT_BOX_SIZE / num_centers
             return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)
-            
+
         print("  Generating geometric representation matrices...")
         dist_pp = torch.cdist(mock_p_coords, mock_p_coords)
         dist_pr = torch.cdist(mock_p_coords, mock_res_coords)
-        
+
         p_geom = mock_rbf_expansion(dist_pp, num_centers=c_p)
         pz_geom = mock_rbf_expansion(dist_pr, num_centers=c_pz)
-        
+
         # Inject density features into point representations
         proj_density = nn.Linear(1, c_p).to(device)
         p = p_geom + proj_density(mock_p_densities.unsqueeze(-1)).unsqueeze(1)
         pz = pz_geom
-        
+
         # Embed sequence and initialize residue pairs
         embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0).to(device)
         initializer = SequenceToPairInitializer(c_s, c_z, MAX_REL_POS).to(device)
-        
+
         s = embedding(mock_tokens)
         z = initializer(s)
-        
+
         # 3. Instantiate EMPairformerStack
         print("  Instantiating EMPairformerStack...")
         em_pairformer = EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4).to(device)
         em_pairformer.eval()
-        
+
         # 4. Forward pass under dynamic Shape Watcher
         print("  Running EM-Pairformer forward pass:")
         with torch.no_grad():
             s_out, z_out, pz_out, p_out = em_pairformer(s, z, pz, p, shape_watch_first=True)
-            
+
         print("\n  [EM-Pairformer Output Shapes Verification]")
         print(f"    Sequence Feature (s): {list(s_out.shape)} (Expected: [1, 20, 64])")
         print(f"    Residue-Residue (z):  {list(z_out.shape)} (Expected: [1, 20, 20, 32])")
         print(f"    Point-Residue (pz):   {list(pz_out.shape)} (Expected: [1, 15, 20, 32])")
         print(f"    Point-Point (p):      {list(p_out.shape)} (Expected: [1, 15, 15, 32])")
-        
+
         assert s_out.shape == (B, N_res, c_s)
         assert z_out.shape == (B, N_res, N_res, c_z)
         assert pz_out.shape == (B, N_point, N_res, c_pz)
         assert p_out.shape == (B, N_point, N_point, c_p)
         print("  Mathematics and dimensions verified successfully!")
-        
+
     run_em_pairformer_shape_watcher_demo()
- 
+
     print("\nLectures 2 & 3 compiled and executed successfully in active Google Colab mode!")

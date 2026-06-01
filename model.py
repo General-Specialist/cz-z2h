@@ -7,6 +7,10 @@ import torch.nn.functional as F
 import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 from tqdm import tqdm
+from sklearn.model_selection import KFold
+from scipy.optimize import linear_sum_assignment
+from einops import rearrange
+
 
 # ==============================================================================
 # CONSTANTS & CONFIGURATIONS
@@ -165,10 +169,10 @@ class SpatialTransformerBlock3d(nn.Module):
         b, c, h, w, d = x.shape
         h_in = x
         x = self.norm(x)
-        x = self.proj_in(x).permute(0, 2, 3, 4, 1).view(b, h * w * d, c)
+        x = rearrange(self.proj_in(x), "b c h w d -> b (h w d) c")
         x = x + self.attn(self.norm_attn(x), self.norm_attn(x), self.norm_attn(x))[0]
         x = x + self.ff(self.norm_ff(x))
-        x = x.view(b, h, w, d, c).permute(0, 4, 1, 2, 3)
+        x = rearrange(x, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
         return h_in + self.proj_out(x)
 
 
@@ -373,18 +377,18 @@ class AttentionPairBias(nn.Module):
         B, N, _ = s.shape
         H = self.n_heads
 
-        q = self.proj_q(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3)
-        k = self.proj_k(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3)
-        v = self.proj_v(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3)
+        q = rearrange(self.proj_q(s), "b n (h d) -> b h n d", h=H)
+        k = rearrange(self.proj_k(s), "b n (h d) -> b h n d", h=H)
+        v = rearrange(self.proj_v(s), "b n (h d) -> b h n d", h=H)
 
         logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
-        bias = self.proj_bias(z).permute(0, 3, 1, 2)
+        bias = rearrange(self.proj_bias(z), "b i j h -> b h i j")
 
         attn_probs = F.softmax(logits + bias, dim=-1)
         out = torch.matmul(attn_probs, v)
 
-        gate = torch.sigmoid(self.proj_gate(s).view(B, N, H, self.d_k).permute(0, 2, 1, 3))
-        out = (out * gate).permute(0, 2, 1, 3).contiguous().view(B, N, self.c_s)
+        gate = torch.sigmoid(rearrange(self.proj_gate(s), "b n (h d) -> b h n d", h=H))
+        out = rearrange(out * gate, "b h n d -> b n (h d)")
 
         if shape_watch:
             print(f"    [Shape Watcher - AttentionPairBias]\n      s={list(s.shape)}, z={list(z.shape)}, Q/K/V heads={list(q.shape)}")
@@ -404,7 +408,7 @@ class OuterProductMean(nn.Module):
         s_norm = self.ln(s)
         a = self.lin1(s_norm)
         b = self.lin2(s_norm)
-        outer = torch.einsum("b i c, b j d -> b i j c d", a, b).flatten(start_dim=-2)
+        outer = rearrange(torch.einsum("b i c, b j d -> b i j c d", a, b), "b i j c d -> b i j (c d)")
         out = self.lin_out(outer)
 
         if shape_watch:
@@ -558,25 +562,19 @@ class JointAttentionWithPairBias(nn.Module):
         self.proj_out = nn.Linear(c_hidden, c_pz)
 
     def forward(self, pz: torch.Tensor, bias_tensor: torch.Tensor) -> torch.Tensor:
-        B, P, R, _ = pz.shape
         H = self.n_heads
         pz_norm = self.ln_pz(pz)
 
-        perm = (0, 1, 3, 2, 4) if self.along_dim == -2 else (0, 2, 3, 1, 4)
-        perm_out = (0, 1, 3, 2, 4) if self.along_dim == -2 else (0, 3, 1, 2, 4)
+        pat = "b p r (h d) -> b p h r d" if self.along_dim == -2 else "b p r (h d) -> b r h p d"
+        q, k, v = [rearrange(proj(pz_norm), pat, h=H) for proj in (self.proj_q, self.proj_k, self.proj_v)]
 
-        q = self.proj_q(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
-        k = self.proj_k(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
-        v = self.proj_v(pz_norm).view(B, P, R, H, self.d_k).permute(*perm)
-
-        bias = self.proj_bias(self.ln_bias(bias_tensor)).permute(0, 3, 1, 2).unsqueeze(1)
+        bias = rearrange(self.proj_bias(self.ln_bias(bias_tensor)), "b i j h -> b h i j").unsqueeze(1)
         logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
         attn_probs = F.softmax(logits + bias, dim=-1)
 
-        out = torch.matmul(attn_probs, v)
-        gate = torch.sigmoid(self.proj_gate(pz_norm).view(B, P, R, H, self.d_k).permute(*perm))
-
-        out = (out * gate).permute(*perm_out).contiguous().view(B, P, R, -1)
+        gate = torch.sigmoid(rearrange(self.proj_gate(pz_norm), pat, h=H))
+        out_pat = "b p h r d -> b p r (h d)" if self.along_dim == -2 else "b r h p d -> b p r (h d)"
+        out = rearrange(torch.matmul(attn_probs, v) * gate, out_pat)
         return self.proj_out(out)
 
 
@@ -678,30 +676,7 @@ class EMPairformerStack(nn.Module):
 # SECTION 5: K-FOLD AND DUAL GOOGLE COLAB TRAINING PIPELINE
 # ==============================================================================
 
-def get_k_folds(items: list, k: int = 5, seed: int = 42) -> list[list]:
-    random_gen = random.Random(seed)
-    shuffled_items = list(items)
-    random_gen.shuffle(shuffled_items)
-    folds = [[] for _ in range(k)]
-    for idx, item in enumerate(shuffled_items):
-        folds[idx % k].append(item)
-    return folds
 
-
-def get_fold_split(folds: list[list], fold_idx: int) -> tuple[list, list, list]:
-    k = len(folds)
-    test_idx = fold_idx
-    val_idx = (fold_idx + 1) % k
-
-    test_set = folds[test_idx]
-    val_set = folds[val_idx]
-
-    train_set = []
-    for idx in range(k):
-        if idx != test_idx and idx != val_idx:
-            train_set.extend(folds[idx])
-
-    return train_set, val_set, test_set
 
 
 if __name__ == "__main__":
@@ -757,8 +732,9 @@ if __name__ == "__main__":
     MATCHING_RADIUS = 1.5
     spacing = DEFAULT_BOX_SIZE / (GRID_SIZE - 1)
 
-    # Initialize 5 folds on the 8 PDBs
-    pdb_folds = get_k_folds(PDB_IDS, k=K_FOLDS, seed=RANDOM_SEED)
+    # Initialize 5 folds on the 8 PDBs using scikit-learn
+    kf = KFold(n_splits=K_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    pdb_folds = [list(np.array(PDB_IDS)[test_idx]) for _, test_idx in kf.split(PDB_IDS)]
     all_folds_pdb_results = []
 
     global_gt_atoms = 0
@@ -772,7 +748,9 @@ if __name__ == "__main__":
         print(f" RUNNING FOLD {fold_idx + 1}/{K_FOLDS} (60/20/20 SPLIT) ")
         print("="*70)
 
-        train_pids, val_pids, test_pids = get_fold_split(pdb_folds, fold_idx)
+        test_pids = pdb_folds[fold_idx]
+        val_pids = pdb_folds[(fold_idx + 1) % K_FOLDS]
+        train_pids = [pid for i, fold in enumerate(pdb_folds) if i not in (fold_idx, (fold_idx + 1) % K_FOLDS) for pid in fold]
         print(f"Train structures ({len(train_pids)}): {[p.upper() for p in train_pids]}")
         print(f"Validation structures ({len(val_pids)}): {[p.upper() for p in val_pids]}")
         print(f"Test structures ({len(test_pids)}): {[p.upper() for p in test_pids]}")
@@ -885,14 +863,15 @@ if __name__ == "__main__":
 
                     if num_pred_peaks > 0 and len(gt_coords) > 0:
                         dists = torch.cdist(gt_coords.cpu(), pred_coords[:num_pred_peaks])
-                        min_dists, min_idxs = torch.min(dists, dim=-1)
-                        for j, (dist, idx) in enumerate(zip(min_dists, min_idxs)):
-                            if dist.item() <= MATCHING_RADIUS:
+                        row_ind, col_ind = linear_sum_assignment(dists.numpy())
+                        for r, c in zip(row_ind, col_ind):
+                            dist = dists[r, c].item()
+                            if dist <= MATCHING_RADIUS:
                                 pid_matched_atoms += 1
-                                p_coord = pred_coords[idx.item()]
+                                p_coord = pred_coords[c]
                                 grid_idx = torch.clamp(torch.round(p_coord / spacing).long(), 0, GRID_SIZE - 1)
                                 logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
-                                if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[j].item():
+                                if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[r].item():
                                     pid_correct_residues += 1
 
             avg_peaks_per_crop = pid_resolved_peaks / num_test_crops

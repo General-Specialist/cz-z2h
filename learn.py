@@ -167,9 +167,8 @@ class PeakFinder(nn.Module):
 
         peaks_mask = peaks.view(B, -1)
         cum_sum_peaks = torch.cumsum(peaks_mask, dim=-1)
-        peak_positions = (cum_sum_peaks * peaks_mask) -1
-        S_max = peaks_mask & (peak_positions < M).sum(dim=-1).max().item()
-
+        peak_positions = (cum_sum_peaks * peaks_mask) - 1
+        S_max = (peaks_mask & (peak_positions < M)).sum(dim=-1).max().item()
         out_coords = torch.zeros (B, M, 3)
         out_vals = torch.zeros(B, M)
         out_mask = torch.zeros(B, M, dtype=torch.bool)

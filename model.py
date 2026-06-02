@@ -225,14 +225,16 @@ class UNet3D(nn.Module):
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B = density.shape[0]
-        X = density.shape[2]  # Handles 5D shape [B, 1, X, X, X]
+        # Expecting density shape: [B, 1, X, X, X]
+        B, _, X, _, _ = density.shape
         M = DEFAULT_MAX_PEAKS
         spacing = DEFAULT_BOX_SIZE / (X - 1)
 
         ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X, device=density.device)
+        # Using indexing='ij' ensures alignment with 3D array dimensions (Z, Y, X)
         grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)
 
+        # 1. Local Maxima Detection
         max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
         peaks = (density == max_pooled) & (density > DEFAULT_PEAK_THRESHOLD)
 
@@ -243,92 +245,75 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         clash_limit_sq = CLASH_LIMIT ** 2
         inv_two_bandwidth_sq = 1.0 / (2 * DEFAULT_PEAK_BANDWIDTH ** 2)
 
-        # ----------------------------------------------------------------------
-        # 1. Dynamic Batched Active Coordinate Padding
-        # ----------------------------------------------------------------------
-        active_mask = (density > DEFAULT_PEAK_THRESHOLD).view(B, -1)
-        num_active = active_mask.sum(dim=-1)
-        max_active = num_active.max().item()
-
-        # ----------------------------------------------------------------------
-        # 2. Dynamic Batched Seed Padding
-        # ----------------------------------------------------------------------
+        # Flatten spatial dimensions
+        density_flat = density.view(B, -1)
         peaks_mask = peaks.view(B, -1)
-        cum_sum_peaks = torch.cumsum(peaks_mask, dim=-1)
-        peaks_positions = (cum_sum_peaks * peaks_mask) - 1
-        
-        valid_peaks_mask = peaks_mask & (peaks_positions < M)
-        num_peaks = valid_peaks_mask.sum(dim=-1)
-        S_max = num_peaks.max().item()
 
-        if max_active == 0 or S_max == 0:
-            return out_coords, out_vals, out_mask
+        # Vectorized counts for peak points, capped at M
+        peaks_cum = torch.cumsum(peaks_mask.long(), dim=-1)
+        valid_peaks_mask = peaks_mask & (peaks_cum <= M)
 
-        # Populate padded active tensors
-        nz_active = torch.nonzero(active_mask)
-        pos_active = ((torch.cumsum(active_mask, dim=-1) * active_mask) - 1)[active_mask]
-        
-        padded_active_coords = torch.zeros(B, max_active, 3, device=density.device)
-        padded_active_weights = torch.zeros(B, max_active, device=density.device)
-        padded_active_coords[nz_active[:, 0], pos_active] = grid[nz_active[:, 1]]
-        padded_active_weights[nz_active[:, 0], pos_active] = density.view(B, -1)[active_mask]
+        # Extract seeds (up to M) using GPU-native indexing (no sync points)
+        b_idx_s, spatial_idx_s = torch.nonzero(valid_peaks_mask, as_tuple=True)
+        seq_idx_s = peaks_cum[b_idx_s, spatial_idx_s] - 1
 
-        # Populate padded seeds
-        nz_peaks = torch.nonzero(valid_peaks_mask)
-        pos_peaks = peaks_positions[valid_peaks_mask]
-        
-        padded_seeds = torch.zeros(B, S_max, 3, device=density.device)
-        padded_seeds[nz_peaks[:, 0], pos_peaks] = grid[nz_peaks[:, 1]]
+        padded_seeds = torch.zeros(B, M, 3, device=density.device)
+        padded_seeds[b_idx_s, seq_idx_s] = grid[spatial_idx_s]
 
-        # Keep track of active seed masks per batch element
-        valid_seed_mask = torch.arange(S_max, device=density.device).unsqueeze(0) < num_peaks.unsqueeze(1)
-        keep = valid_seed_mask.clone()
+        seeds_mask = torch.zeros(B, M, dtype=torch.bool, device=density.device)
+        seeds_mask[b_idx_s, seq_idx_s] = True
 
-        # ----------------------------------------------------------------------
-        # 3. Batched Mean-Shift Iteration (No Batch Loop)
-        # ----------------------------------------------------------------------
-        padded_active_sq = torch.sum(padded_active_coords ** 2, dim=-1, keepdim=True).transpose(-1, -2)
+        # Zero out weights below threshold on the dense grid to compute mean shift
+        weights_grid = torch.where(density_flat > DEFAULT_PEAK_THRESHOLD, density_flat, 0.0)
+        grid_sq = torch.sum(grid ** 2, dim=-1) # (X^3,)
+
+        # Batched Mean-Shift Iteration using dense grid
+        # Bypasses dynamic extraction and padding to avoid CPU-GPU sync.
+        seeds = padded_seeds
         for _ in range(DEFAULT_PEAK_ITERATIONS):
-            seeds_sq = torch.sum(padded_seeds ** 2, dim=-1, keepdim=True)
-            dot_product = torch.bmm(padded_seeds, padded_active_coords.transpose(-1, -2))
-            sq_dists = torch.clamp(seeds_sq + padded_active_sq - 2 * dot_product, min=0.0)
+            seeds_sq = torch.sum(seeds ** 2, dim=-1, keepdim=True)
+            dot_product = torch.matmul(seeds, grid.T)
 
-            weights = torch.exp(-sq_dists * inv_two_bandwidth_sq) * padded_active_weights.unsqueeze(1)
-            padded_seeds = torch.bmm(weights, padded_active_coords) / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+            sq_dists = torch.clamp(seeds_sq + grid_sq.unsqueeze(0) - 2 * dot_product, min=0.0)
+            weights = torch.exp(-sq_dists * inv_two_bandwidth_sq) * weights_grid.unsqueeze(1)
 
-        # ----------------------------------------------------------------------
-        # 4. Batched Clash Removal (Parallelized across Batch elements)
-        # ----------------------------------------------------------------------
-        for i in range(S_max):
-            if i == S_max - 1: break
-            seeds_i = padded_seeds[:, i:i+1]
-            seeds_rest = padded_seeds[:, i+1:]
-            
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-8
+            seeds = torch.matmul(weights, grid) / denominator
+
+        # Clash Removal (Loop over constant M-1 to keep execution fully on GPU)
+        keep = seeds_mask.clone()
+        for i in range(M - 1):
+            seeds_i = seeds[:, i:i+1]
+            seeds_rest = seeds[:, i+1:]
+
             sq_dists = torch.sum((seeds_rest - seeds_i) ** 2, dim=-1)
-            clash = (sq_dists < clash_limit_sq) & keep[:, i:i+1]
-            keep[:, i+1:][clash] = False
+            clash = (sq_dists < clash_limit_sq) & keep[:, i:i+1] & keep[:, i+1:]
+            keep[:, i+1:].masked_fill_(clash, False)
 
-        # ----------------------------------------------------------------------
-        # 5. Pack Kept Seeds to Contiguous Output Tensors
-        # ----------------------------------------------------------------------
-        keep_cumsum = torch.cumsum(keep, dim=-1)
-        keep_positions = (keep_cumsum * keep) - 1
-        final_keep = keep & (keep_positions < M)
+        # Vectorized Packing to contiguous output tensors (Zero Sync Points)
+        keep_cum = torch.cumsum(keep.long(), dim=-1)
+        target_idx = keep_cum - 1
 
-        nz_final = torch.nonzero(final_keep)
-        b_final = nz_final[:, 0]
-        s_final = nz_final[:, 1]
-        pos_final = keep_positions[final_keep]
+        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)
+        out_seq_idx = target_idx[b_idx_o, seq_idx_o]
 
-        coords_final = padded_seeds[b_final, s_final]
-        coords_grid = (coords_final / spacing).round().long().clamp(0, X-1)
+        out_coords[b_idx_o, out_seq_idx] = seeds[b_idx_o, seq_idx_o]
+        out_mask[b_idx_o, out_seq_idx] = True
 
-        out_coords[b_final, pos_final] = coords_final
-        out_vals[b_final, pos_final] = density[b_final, 0, coords_grid[:, 0], coords_grid[:, 1], coords_grid[:, 2]]
-        out_mask[b_final, pos_final] = True
+        # Voxel density lookup
+        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)
+        batch_idx = torch.arange(B, device=density.device).unsqueeze(1).expand(B, M)
+
+        lookup_vals = density[
+            batch_idx,
+            0,
+            coords_grid[..., 0],
+            coords_grid[..., 1],
+            coords_grid[..., 2]
+        ]
+        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
 
         return out_coords, out_vals, out_mask
-
 
 # ==============================================================================
 # SECTION 4: THE PAIRFORMER ARCHITECTURE (Lecture 3)
@@ -671,13 +656,9 @@ class EMPairformerStack(nn.Module):
             s, z, pz, p = block(s, z, pz, p, shape_watch=(shape_watch_first and i == 0))
         return s, z, pz, p
 
-
 # ==============================================================================
-# SECTION 5: K-FOLD AND DUAL GOOGLE COLAB TRAINING PIPELINE
+# SECTION 5: K-FOLD AND GOOGLE COLAB TRAINING PIPELINE
 # ==============================================================================
-
-
-
 
 if __name__ == "__main__":
     torch.manual_seed(RANDOM_SEED)
@@ -1036,5 +1017,3 @@ if __name__ == "__main__":
         print("  Mathematics and dimensions verified successfully!")
 
     run_em_pairformer_shape_watcher_demo()
-
-    print("\nLectures 2 & 3 compiled and executed successfully in active Google Colab mode!")

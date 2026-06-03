@@ -837,8 +837,8 @@ if __name__ == "__main__":
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    best_atom_state = {k: v.cpu() for k, v in unet_atom.state_dict().items()}
-                    best_res_state = {k: v.cpu() for k, v in unet_res.state_dict().items()}
+                    best_atom_state = {k: v.clone() for k, v in unet_atom.state_dict().items()}
+                    best_res_state = {k: v.clone() for k, v in unet_res.state_dict().items()}
 
         # Restore best model for testing
         if best_atom_state is not None:
@@ -872,20 +872,20 @@ if __name__ == "__main__":
                     pred_coords, _, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_mask: [1, M]
                     pred_res_logits = unet_res(test_in_batch)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                    pred_coords = pred_coords[0].cpu()  # [M, 3]
+                    pred_coords_gpu = pred_coords[0]  # [M, 3]
                     num_pred_peaks = pred_mask[0].sum().item()  # scaler
 
                     pid_resolved_peaks += num_pred_peaks
                     pid_gt_atoms += len(gt_coords)
 
                     if num_pred_peaks > 0 and len(gt_coords) > 0:
-                        dists = torch.cdist(gt_coords.cpu(), pred_coords[:num_pred_peaks])  # [N_cropped, num_pred_peaks]
-                        row_ind, col_ind = linear_sum_assignment(dists.numpy())
+                        dists = torch.cdist(gt_coords, pred_coords_gpu[:num_pred_peaks])  # [N_cropped, num_pred_peaks]
+                        row_ind, col_ind = linear_sum_assignment(dists.cpu().numpy())
                         for r, c in zip(row_ind, col_ind):
                             dist = dists[r, c].item()
                             if dist <= MATCHING_RADIUS:
                                 pid_matched_atoms += 1
-                                p_coord = pred_coords[c]  # [3]
+                                p_coord = pred_coords_gpu[c]  # [3]
                                 grid_idx = torch.clamp(torch.round(p_coord / spacing).long(), 0, GRID_SIZE - 1)  # [3]
                                 logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]  # [C_res]
                                 if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[r].item():

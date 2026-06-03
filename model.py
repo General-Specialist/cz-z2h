@@ -49,7 +49,8 @@ NUM_BLOCKS = 3
 MAX_REL_POS = 32
 CONTACT_THRESHOLD = 8.0
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_device('cuda')
+device = torch.device("cuda")
 print(f"Using device: {device}")
 
 # ==============================================================================
@@ -67,66 +68,73 @@ def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: 
     """
     Vectorized, chunk-free grid rasterization using torch.cdist.
     """
-    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE, device=coords.device)
-    grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')
-    grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)
+    # coords shape: [N_atoms, 3]
+    # res_indices shape: [N_atoms]
+    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE)  # [GRID_SIZE]
+    grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')  # each [GRID_SIZE, GRID_SIZE, GRID_SIZE]
+    grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)  # [GRID_SIZE^3, 3]
 
-    dists = torch.cdist(grid, coords)
-    density = torch.exp(-dists**2 / (2 * sigma**2)).sum(dim=-1).view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
-    binary_grid = (dists <= radius).any(dim=-1).float().view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+    dists = torch.cdist(grid, coords)  # [GRID_SIZE^3, N_atoms]
+    density = torch.exp(-dists**2 / (2 * sigma**2)).sum(dim=-1).view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
+    binary_grid = (dists <= radius).any(dim=-1).float().view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-    min_dists, min_idx = torch.min(dists, dim=-1)
-    residue_grid = torch.zeros(grid.shape[0], dtype=torch.long, device=coords.device)
-    valid_mask = min_dists <= radius
-    residue_grid[valid_mask] = res_indices[min_idx[valid_mask]]
+    min_dists, min_idx = torch.min(dists, dim=-1)  # both [GRID_SIZE^3]
+    residue_grid = torch.zeros(grid.shape[0], dtype=torch.long)  # [GRID_SIZE^3]
+    valid_mask = min_dists <= radius  # [GRID_SIZE^3]
+    residue_grid[valid_mask] = res_indices[min_idx[valid_mask]]  # [GRID_SIZE^3]
 
-    return density, binary_grid, residue_grid.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+    return density, binary_grid, residue_grid.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # returned as [GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
 
 def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, return_coords: bool = False) -> tuple:
-    coords, res_indices = random.choice(structures)
-    center = coords[torch.randint(0, len(coords), (1,)).item()]
+    coords, res_indices = random.choice(structures)  # coords: [N_atoms, 3], res_indices: [N_atoms]
+    center = coords[torch.randint(0, len(coords), (1,))].squeeze(0)  # [3]
 
     half_box = DEFAULT_BOX_SIZE / 2.0
-    mask = torch.all((coords >= center - half_box) & (coords <= center + half_box), dim=-1)
+    mask = torch.all((coords >= center - half_box) & (coords <= center + half_box), dim=-1)  # [N_atoms]
 
-    cropped_coords = coords[mask] - center + half_box
-    cropped_res = res_indices[mask]
+    cropped_coords = coords[mask] - center + half_box  # [N_cropped, 3]
+    cropped_res = res_indices[mask]  # [N_cropped]
 
     sigma = random.uniform(0.8, 1.8) if is_training else 1.2
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
 
     density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=DEFAULT_RADIUS)
 
-    out_density = F.relu(density + torch.randn_like(density) * noise)
+    out_density = F.relu(density + torch.randn_like(density) * noise)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
     if return_coords:
         return out_density, binary_grid, residue_grid, cropped_coords, cropped_res
     return out_density, binary_grid, residue_grid
 
 
 def augment_batch_3d_joint(inputs: torch.Tensor, target_atoms: torch.Tensor, target_res: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # inputs shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+    # target_atoms shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+    # target_res shape: [B, GRID_SIZE, GRID_SIZE, GRID_SIZE]
     for b in range(inputs.shape[0]):
         for dim in (-3, -2, -1):
             if random.random() > 0.5:
-                inputs[b] = torch.flip(inputs[b], [dim])
-                target_atoms[b] = torch.flip(target_atoms[b], [dim])
-                target_res[b] = torch.flip(target_res[b], [dim])
+                inputs[b] = torch.flip(inputs[b], [dim])  # [1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                target_atoms[b] = torch.flip(target_atoms[b], [dim])  # [1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                target_res[b] = torch.flip(target_res[b], [dim])  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
         for plane in [(-3, -2), (-2, -1), (-3, -1)]:
             k = random.randint(0, 3)
             if k > 0:
-                inputs[b] = torch.rot90(inputs[b], k, plane)
-                target_atoms[b] = torch.rot90(target_atoms[b], k, plane)
-                target_res[b] = torch.rot90(target_res[b], k, plane)
+                inputs[b] = torch.rot90(inputs[b], k, plane)  # [1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                target_atoms[b] = torch.rot90(target_atoms[b], k, plane)  # [1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                target_res[b] = torch.rot90(target_res[b], k, plane)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
     return inputs, target_atoms, target_res
 
 
 class BCEDiceLoss(nn.Module):
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # logits shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        # target shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
         bce = F.binary_cross_entropy_with_logits(logits, target)
-        pred = torch.sigmoid(logits)
-        p_flat, t_flat = pred.flatten(1), target.flatten(1)
-        intersection = (p_flat * t_flat).sum(dim=-1)
-        dice = 1.0 - (2.0 * intersection + 1e-6) / (p_flat.sum(dim=-1) + t_flat.sum(dim=-1) + 1e-6)
+        pred = torch.sigmoid(logits)  # [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        p_flat, t_flat = pred.flatten(1), target.flatten(1)  # both [B, GRID_SIZE^3]
+        intersection = (p_flat * t_flat).sum(dim=-1)  # [B]
+        dice = 1.0 - (2.0 * intersection + 1e-6) / (p_flat.sum(dim=-1) + t_flat.sum(dim=-1) + 1e-6)  # [B]
         return bce + dice.mean()
 
 
@@ -149,7 +157,8 @@ class ConvBlock3d(nn.Module):
         self.skip = nn.Identity() if in_c == out_c else nn.Conv3d(in_c, out_c, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.skip(x) + self.net(x)
+        # x shape: [B, in_c, H, W, D]
+        return self.skip(x) + self.net(x)  # returns [B, out_c, H, W, D]
 
 
 class SpatialTransformerBlock3d(nn.Module):
@@ -166,14 +175,15 @@ class SpatialTransformerBlock3d(nn.Module):
         self.norm_ff = nn.LayerNorm(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [B, channels, H, W, D]
         b, c, h, w, d = x.shape
-        h_in = x
-        x = self.norm(x)
-        x = rearrange(self.proj_in(x), "b c h w d -> b (h w d) c")
-        x = x + self.attn(self.norm_attn(x), self.norm_attn(x), self.norm_attn(x))[0]
-        x = x + self.ff(self.norm_ff(x))
-        x = rearrange(x, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
-        return h_in + self.proj_out(x)
+        h_in = x  # [B, channels, H, W, D]
+        x = self.norm(x)  # [B, channels, H, W, D]
+        x = rearrange(self.proj_in(x), "b c h w d -> b (h w d) c")  # [B, H*W*D, channels]
+        x = x + self.attn(self.norm_attn(x), self.norm_attn(x), self.norm_attn(x))[0]  # [B, H*W*D, channels]
+        x = x + self.ff(self.norm_ff(x))  # [B, H*W*D, channels]
+        x = rearrange(x, "b (h w d) c -> b c h w d", h=h, w=w, d=d)  # [B, channels, H, W, D]
+        return h_in + self.proj_out(x)  # [B, channels, H, W, D]
 
 
 class UNet3D(nn.Module):
@@ -200,23 +210,24 @@ class UNet3D(nn.Module):
         self.ds_conv = nn.Conv3d(f * 2, out_channels, 1)
 
     def forward(self, x: torch.Tensor, return_ds: bool = False) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
-        x1 = self.down1(x)
-        p1 = self.pool1(x1)
-        x2 = self.down2(p1)
-        p2 = self.pool2(x2)
+        # x shape: [B, in_channels, H, W, D]
+        x1 = self.down1(x)  # [B, f, H, W, D]
+        p1 = self.pool1(x1)  # [B, f, H/2, W/2, D/2]
+        x2 = self.down2(p1)  # [B, f*2, H/2, W/2, D/2]
+        p2 = self.pool2(x2)  # [B, f*2, H/4, W/4, D/4]
 
-        b = self.bottleneck(p2)
+        b = self.bottleneck(p2)  # [B, f*4, H/4, W/4, D/4]
 
-        u1 = self.up1(b)
-        x3 = self.conv_up1(torch.cat([u1, x2], dim=1))
+        u1 = self.up1(b)  # [B, f*4, H/2, W/2, D/2]
+        x3 = self.conv_up1(torch.cat([u1, x2], dim=1))  # concat -> [B, f*6, H/2, W/2, D/2] -> conv -> [B, f*2, H/2, W/2, D/2]
 
-        u2 = self.up2(x3)
-        x4 = self.conv_up2(torch.cat([u2, x1], dim=1))
+        u2 = self.up2(x3)  # [B, f*2, H, W, D]
+        x4 = self.conv_up2(torch.cat([u2, x1], dim=1))  # concat -> [B, f*3, H, W, D] -> conv -> [B, f, H, W, D]
 
-        out = self.out_conv(x4)
+        out = self.out_conv(x4)  # [B, out_channels, H, W, D]
         if return_ds:
-            return out, self.ds_conv(x3)
-        return out
+            return out, self.ds_conv(x3)  # out: [B, out_channels, H, W, D], ds_conv(x3): [B, out_channels, H/2, W/2, D/2]
+        return out  # [B, out_channels, H, W, D]
 
 
 # ==============================================================================
@@ -230,79 +241,79 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         M = DEFAULT_MAX_PEAKS
         spacing = DEFAULT_BOX_SIZE / (X - 1)
 
-        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X, device=density.device)
+        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X)  # [X]
         # Using indexing='ij' ensures alignment with 3D array dimensions (Z, Y, X)
-        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)
+        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)  # [X^3, 3]
 
         # 1. Local Maxima Detection
-        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
-        peaks = (density == max_pooled) & (density > DEFAULT_PEAK_THRESHOLD)
+        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)  # [B, 1, X, X, X]
+        peaks = (density == max_pooled) & (density > DEFAULT_PEAK_THRESHOLD)  # [B, 1, X, X, X]
 
-        out_coords = torch.zeros(B, M, 3, device=density.device)
-        out_vals = torch.zeros(B, M, device=density.device)
-        out_mask = torch.zeros(B, M, dtype=torch.bool, device=density.device)
+        out_coords = torch.zeros(B, M, 3)  # [B, M, 3]
+        out_vals = torch.zeros(B, M)  # [B, M]
+        out_mask = torch.zeros(B, M, dtype=torch.bool)  # [B, M]
 
         clash_limit_sq = CLASH_LIMIT ** 2
         inv_two_bandwidth_sq = 1.0 / (2 * DEFAULT_PEAK_BANDWIDTH ** 2)
 
         # Flatten spatial dimensions
-        density_flat = density.view(B, -1)
-        peaks_mask = peaks.view(B, -1)
+        density_flat = density.view(B, -1)  # [B, X^3]
+        peaks_mask = peaks.view(B, -1)  # [B, X^3]
 
         # Vectorized counts for peak points, capped at M
-        peaks_cum = torch.cumsum(peaks_mask.long(), dim=-1)
-        valid_peaks_mask = peaks_mask & (peaks_cum <= M)
+        peaks_cum = torch.cumsum(peaks_mask.long(), dim=-1)  # [B, X^3]
+        valid_peaks_mask = peaks_mask & (peaks_cum <= M)  # [B, X^3]
 
         # Extract seeds (up to M) using GPU-native indexing (no sync points)
-        b_idx_s, spatial_idx_s = torch.nonzero(valid_peaks_mask, as_tuple=True)
-        seq_idx_s = peaks_cum[b_idx_s, spatial_idx_s] - 1
+        b_idx_s, spatial_idx_s = torch.nonzero(valid_peaks_mask, as_tuple=True)  # both [N_seeds]
+        seq_idx_s = peaks_cum[b_idx_s, spatial_idx_s] - 1  # [N_seeds]
 
-        padded_seeds = torch.zeros(B, M, 3, device=density.device)
+        padded_seeds = torch.zeros(B, M, 3)  # [B, M, 3]
         padded_seeds[b_idx_s, seq_idx_s] = grid[spatial_idx_s]
 
-        seeds_mask = torch.zeros(B, M, dtype=torch.bool, device=density.device)
+        seeds_mask = torch.zeros(B, M, dtype=torch.bool)  # [B, M]
         seeds_mask[b_idx_s, seq_idx_s] = True
 
         # Zero out weights below threshold on the dense grid to compute mean shift
-        weights_grid = torch.where(density_flat > DEFAULT_PEAK_THRESHOLD, density_flat, 0.0)
-        grid_sq = torch.sum(grid ** 2, dim=-1) # (X^3,)
+        weights_grid = torch.where(density_flat > DEFAULT_PEAK_THRESHOLD, density_flat, 0.0)  # [B, X^3]
+        grid_sq = torch.sum(grid ** 2, dim=-1) # (X^3,)  # [X^3]
 
         # Batched Mean-Shift Iteration using dense grid
         # Bypasses dynamic extraction and padding to avoid CPU-GPU sync.
-        seeds = padded_seeds
+        seeds = padded_seeds  # [B, M, 3]
         for _ in range(DEFAULT_PEAK_ITERATIONS):
-            seeds_sq = torch.sum(seeds ** 2, dim=-1, keepdim=True)
-            dot_product = torch.matmul(seeds, grid.T)
+            seeds_sq = torch.sum(seeds ** 2, dim=-1, keepdim=True)  # [B, M, 1]
+            dot_product = torch.matmul(seeds, grid.T)  # [B, M, X^3]
 
-            sq_dists = torch.clamp(seeds_sq + grid_sq.unsqueeze(0) - 2 * dot_product, min=0.0)
-            weights = torch.exp(-sq_dists * inv_two_bandwidth_sq) * weights_grid.unsqueeze(1)
+            sq_dists = torch.clamp(seeds_sq + grid_sq.unsqueeze(0) - 2 * dot_product, min=0.0)  # [B, M, X^3]
+            weights = torch.exp(-sq_dists * inv_two_bandwidth_sq) * weights_grid.unsqueeze(1)  # [B, M, X^3]
 
-            denominator = weights.sum(dim=-1, keepdim=True) + 1e-8
-            seeds = torch.matmul(weights, grid) / denominator
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-8  # [B, M, 1]
+            seeds = torch.matmul(weights, grid) / denominator  # [B, M, 3]
 
         # Clash Removal (Loop over constant M-1 to keep execution fully on GPU)
-        keep = seeds_mask.clone()
+        keep = seeds_mask.clone()  # [B, M]
         for i in range(M - 1):
-            seeds_i = seeds[:, i:i+1]
-            seeds_rest = seeds[:, i+1:]
+            seeds_i = seeds[:, i:i+1]  # [B, 1, 3]
+            seeds_rest = seeds[:, i+1:]  # [B, M - (i+1), 3]
 
-            sq_dists = torch.sum((seeds_rest - seeds_i) ** 2, dim=-1)
-            clash = (sq_dists < clash_limit_sq) & keep[:, i:i+1] & keep[:, i+1:]
-            keep[:, i+1:].masked_fill_(clash, False)
+            sq_dists = torch.sum((seeds_rest - seeds_i) ** 2, dim=-1)  # [B, M - (i+1)]
+            clash = (sq_dists < clash_limit_sq) & keep[:, i:i+1] & keep[:, i+1:]  # [B, M - (i+1)]
+            keep[:, i+1:].masked_fill_(clash, False)  # [B, M]
 
         # Vectorized Packing to contiguous output tensors (Zero Sync Points)
-        keep_cum = torch.cumsum(keep.long(), dim=-1)
-        target_idx = keep_cum - 1
+        keep_cum = torch.cumsum(keep.long(), dim=-1)  # [B, M]
+        target_idx = keep_cum - 1  # [B, M]
 
-        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)
-        out_seq_idx = target_idx[b_idx_o, seq_idx_o]
+        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)  # both [N_active]
+        out_seq_idx = target_idx[b_idx_o, seq_idx_o]  # [N_active]
 
         out_coords[b_idx_o, out_seq_idx] = seeds[b_idx_o, seq_idx_o]
         out_mask[b_idx_o, out_seq_idx] = True
 
         # Voxel density lookup
-        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)
-        batch_idx = torch.arange(B, device=density.device).unsqueeze(1).expand(B, M)
+        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)  # [B, M, 3]
+        batch_idx = torch.arange(B).unsqueeze(1).expand(B, M)  # [B, M]
 
         lookup_vals = density[
             batch_idx,
@@ -310,8 +321,8 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
             coords_grid[..., 0],
             coords_grid[..., 1],
             coords_grid[..., 2]
-        ]
-        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
+        ]  # [B, M]
+        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)  # [B, M]
 
         return out_coords, out_vals, out_mask
 
@@ -326,10 +337,10 @@ class RelativePositionEmbedding(nn.Module):
         self.num_bins = 2 * max_rel_pos + 1
         self.emb = nn.Embedding(self.num_bins, c_z)
 
-    def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        pos = torch.arange(seq_len, device=device)
-        diff = pos.unsqueeze(1) - pos.unsqueeze(0)
-        return self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)
+    def forward(self, seq_len: int) -> torch.Tensor:
+        pos = torch.arange(seq_len)  # [seq_len]
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # [seq_len, seq_len]
+        return self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)  # [seq_len, seq_len, c_z]
 
 
 class SequenceToPairInitializer(nn.Module):
@@ -340,9 +351,10 @@ class SequenceToPairInitializer(nn.Module):
         self.rel_pos = RelativePositionEmbedding(max_rel_pos, c_z)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        s_q = self.linear_s_q(s).unsqueeze(2)
-        s_k = self.linear_s_k(s).unsqueeze(1)
-        return s_q + s_k + self.rel_pos(s.shape[1], s.device).unsqueeze(0)
+        # s shape: [B, seq_len, c_s]
+        s_q = self.linear_s_q(s).unsqueeze(2)  # [B, seq_len, 1, c_z]
+        s_k = self.linear_s_k(s).unsqueeze(1)  # [B, 1, seq_len, c_z]
+        return s_q + s_k + self.rel_pos(s.shape[1]).unsqueeze(0)  # [B, seq_len, seq_len, c_z]
 
 
 class AttentionPairBias(nn.Module):
@@ -359,26 +371,28 @@ class AttentionPairBias(nn.Module):
         self.proj_out = nn.Linear(c_s, c_s)
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
+        # s shape: [B, N, c_s]
+        # z shape: [B, N, N, c_z]
         B, N, _ = s.shape
         H = self.n_heads
 
-        q = rearrange(self.proj_q(s), "b n (h d) -> b h n d", h=H)
-        k = rearrange(self.proj_k(s), "b n (h d) -> b h n d", h=H)
-        v = rearrange(self.proj_v(s), "b n (h d) -> b h n d", h=H)
+        q = rearrange(self.proj_q(s), "b n (h d) -> b h n d", h=H)  # [B, H, N, d_k]
+        k = rearrange(self.proj_k(s), "b n (h d) -> b h n d", h=H)  # [B, H, N, d_k]
+        v = rearrange(self.proj_v(s), "b n (h d) -> b h n d", h=H)  # [B, H, N, d_k]
 
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
-        bias = rearrange(self.proj_bias(z), "b i j h -> b h i j")
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, H, N, N]
+        bias = rearrange(self.proj_bias(z), "b i j h -> b h i j")  # [B, H, N, N]
 
-        attn_probs = F.softmax(logits + bias, dim=-1)
-        out = torch.matmul(attn_probs, v)
+        attn_probs = F.softmax(logits + bias, dim=-1)  # [B, H, N, N]
+        out = torch.matmul(attn_probs, v)  # [B, H, N, d_k]
 
-        gate = torch.sigmoid(rearrange(self.proj_gate(s), "b n (h d) -> b h n d", h=H))
-        out = rearrange(out * gate, "b h n d -> b n (h d)")
+        gate = torch.sigmoid(rearrange(self.proj_gate(s), "b n (h d) -> b h n d", h=H))  # [B, H, N, d_k]
+        out = rearrange(out * gate, "b h n d -> b n (h d)")  # [B, N, c_s]
 
         if shape_watch:
             print(f"    [Shape Watcher - AttentionPairBias]\n      s={list(s.shape)}, z={list(z.shape)}, Q/K/V heads={list(q.shape)}")
 
-        return self.proj_out(out)
+        return self.proj_out(out)  # [B, N, c_s]
 
 
 class OuterProductMean(nn.Module):
@@ -390,16 +404,17 @@ class OuterProductMean(nn.Module):
         self.lin_out = nn.Linear(c_hidden ** 2, c_z)
 
     def forward(self, s: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        s_norm = self.ln(s)
-        a = self.lin1(s_norm)
-        b = self.lin2(s_norm)
-        outer = rearrange(torch.einsum("b i c, b j d -> b i j c d", a, b), "b i j c d -> b i j (c d)")
-        out = self.lin_out(outer)
+        # s shape: [B, N, c_s]
+        s_norm = self.ln(s)  # [B, N, c_s]
+        a = self.lin1(s_norm)  # [B, N, c_hidden]
+        b = self.lin2(s_norm)  # [B, N, c_hidden]
+        outer = rearrange(torch.einsum("b i c, b j d -> b i j c d", a, b), "b i j c d -> b i j (c d)")  # [B, N, N, c_hidden * c_hidden]
+        out = self.lin_out(outer)  # [B, N, N, c_z]
 
         if shape_watch:
             print(f"    [Shape Watcher - OuterProductMean]\n      outer_flat={list(outer.shape)}, z_update={list(out.shape)}")
 
-        return out
+        return out  # [B, N, N, c_z]
 
 
 class TriangleMultiplicativeUpdate(nn.Module):
@@ -414,16 +429,17 @@ class TriangleMultiplicativeUpdate(nn.Module):
         self.lin_gate_out = nn.Linear(c_z, c_z)
 
     def forward(self, z: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        z_norm = self.ln(z)
-        a = torch.sigmoid(self.lin_gate_a(z_norm)) * self.lin_a(z_norm)
-        b = torch.sigmoid(self.lin_gate_b(z_norm)) * self.lin_b(z_norm)
-        out = torch.einsum("b i k c, b j k c -> b i j c", a, b)
-        final_out = self.lin_out(out) * torch.sigmoid(self.lin_gate_out(z_norm))
+        # z shape: [B, N, N, c_z]
+        z_norm = self.ln(z)  # [B, N, N, c_z]
+        a = torch.sigmoid(self.lin_gate_a(z_norm)) * self.lin_a(z_norm)  # [B, N, N, c_hidden]
+        b = torch.sigmoid(self.lin_gate_b(z_norm)) * self.lin_b(z_norm)  # [B, N, N, c_hidden]
+        out = torch.einsum("b i k c, b j k c -> b i j c", a, b)  # [B, N, N, c_hidden]
+        final_out = self.lin_out(out) * torch.sigmoid(self.lin_gate_out(z_norm))  # [B, N, N, c_z]
 
         if shape_watch:
             print(f"    [Shape Watcher - TriangleMultiplicativeUpdate]\n      gathered_sum={list(out.shape)}")
 
-        return final_out
+        return final_out  # [B, N, N, c_z]
 
 
 class PairformerBlock(nn.Module):
@@ -441,14 +457,16 @@ class PairformerBlock(nn.Module):
         )
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        # s shape: [B, N, c_s]
+        # z shape: [B, N, N, c_z]
         if shape_watch: print("\n=== STARTING PAIRFORMER BLOCK SHAPE-WATCHING ===")
-        s = s + self.attn(self.ln_s1(s), z, shape_watch=shape_watch)
-        s = s + self.transition_s(s)
-        z = z + self.opm(s, shape_watch=shape_watch)
-        z = z + self.tri_mul(z, shape_watch=shape_watch)
-        z = z + self.transition_z(z)
+        s = s + self.attn(self.ln_s1(s), z, shape_watch=shape_watch)  # [B, N, c_s]
+        s = s + self.transition_s(s)  # [B, N, c_s]
+        z = z + self.opm(s, shape_watch=shape_watch)  # [B, N, N, c_z]
+        z = z + self.tri_mul(z, shape_watch=shape_watch)  # [B, N, N, c_z]
+        z = z + self.transition_z(z)  # [B, N, N, c_z]
         if shape_watch: print("=== END PAIRFORMER BLOCK SHAPE-WATCHING ===\n")
-        return s, z
+        return s, z  # ([B, N, c_s], [B, N, N, c_z])
 
 
 class PairformerStack(nn.Module):
@@ -473,10 +491,11 @@ class PairformerContactPredictor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        s = self.embedding(x)
-        z = self.initializer(s)
-        s, z = self.pairformer(s, z, shape_watch_first=shape_watch)
-        return self.contact_head(z).squeeze(-1)
+        # x shape: [B, N] (residue sequence tokens)
+        s = self.embedding(x)  # [B, N, c_s]
+        z = self.initializer(s)  # [B, N, N, c_z]
+        s, z = self.pairformer(s, z, shape_watch_first=shape_watch)  # ([B, N, c_s], [B, N, N, c_z])
+        return self.contact_head(z).squeeze(-1)  # [B, N, N]
 
 
 def print_ascii_contact_map(gt: torch.Tensor, pred: torch.Tensor, threshold: float = 0.5):
@@ -511,23 +530,23 @@ class InterMultiplicativeUpdate(nn.Module):
 
     def forward(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         # z: [B, N_res, N_res, c_z], p: [B, N_point, N_point, c_p]
-        p_norm = self.ln_p(p)
-        z_norm = self.ln_z(z)
+        p_norm = self.ln_p(p)  # [B, N_point, N_point, c_p]
+        z_norm = self.ln_z(z)  # [B, N_res, N_res, c_z]
 
-        x_p = torch.sigmoid(self.lin_p_gate(p_norm)) * self.lin_p_proj(p_norm)
-        x_z = torch.sigmoid(self.lin_z_gate(z_norm)) * self.lin_z_proj(z_norm)
+        x_p = torch.sigmoid(self.lin_p_gate(p_norm)) * self.lin_p_proj(p_norm)  # [B, N_point, N_point, c_hidden]
+        x_z = torch.sigmoid(self.lin_z_gate(z_norm)) * self.lin_z_proj(z_norm)  # [B, N_res, N_res, c_hidden]
 
         if self.outgoing:
             # sum over intermediate connections to find outgoing paths (dim -2)
-            z_p = x_p.sum(dim=-2) # [B, N_point, c_hidden]
-            z_z = x_z.sum(dim=-2) # [B, N_res, c_hidden]
+            z_p = x_p.sum(dim=-2)  # [B, N_point, c_hidden]
+            z_z = x_z.sum(dim=-2)  # [B, N_res, c_hidden]
         else:
             # incoming paths (dim -3)
-            z_p = x_p.sum(dim=-3) # [B, N_point, c_hidden]
-            z_z = x_z.sum(dim=-3) # [B, N_res, c_hidden]
+            z_p = x_p.sum(dim=-3)  # [B, N_point, c_hidden]
+            z_z = x_z.sum(dim=-3)  # [B, N_res, c_hidden]
 
-        out = torch.einsum("b p h, b r h -> b p r h", z_p, z_z)
-        return self.lin_out(self.ln_out(out))
+        out = torch.einsum("b p h, b r h -> b p r h", z_p, z_z)  # [B, N_point, N_res, c_hidden]
+        return self.lin_out(self.ln_out(out))  # [B, N_point, N_res, c_pz]
 
 
 class JointAttentionWithPairBias(nn.Module):
@@ -547,20 +566,22 @@ class JointAttentionWithPairBias(nn.Module):
         self.proj_out = nn.Linear(c_hidden, c_pz)
 
     def forward(self, pz: torch.Tensor, bias_tensor: torch.Tensor) -> torch.Tensor:
+        # pz shape: [B, N_point, N_res, c_pz]
+        # bias_tensor shape: [B, N_res, N_res, c_bias] or [B, N_point, N_point, c_bias]
         H = self.n_heads
-        pz_norm = self.ln_pz(pz)
+        pz_norm = self.ln_pz(pz)  # [B, N_point, N_res, c_pz]
 
         pat = "b p r (h d) -> b p h r d" if self.along_dim == -2 else "b p r (h d) -> b r h p d"
-        q, k, v = [rearrange(proj(pz_norm), pat, h=H) for proj in (self.proj_q, self.proj_k, self.proj_v)]
+        q, k, v = [rearrange(proj(pz_norm), pat, h=H) for proj in (self.proj_q, self.proj_k, self.proj_v)]  # each [B, N_point, H, N_res, d] or [B, N_res, H, N_point, d]
 
-        bias = rearrange(self.proj_bias(self.ln_bias(bias_tensor)), "b i j h -> b h i j").unsqueeze(1)
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
-        attn_probs = F.softmax(logits + bias, dim=-1)
+        bias = rearrange(self.proj_bias(self.ln_bias(bias_tensor)), "b i j h -> b h i j").unsqueeze(1)  # [B, 1, H, N_dim, N_dim]
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, N_point, H, N_res, N_res] or [B, N_res, H, N_point, N_point]
+        attn_probs = F.softmax(logits + bias, dim=-1)  # [B, N_point, H, N_res, N_res] or [B, N_res, H, N_point, N_point]
 
-        gate = torch.sigmoid(rearrange(self.proj_gate(pz_norm), pat, h=H))
+        gate = torch.sigmoid(rearrange(self.proj_gate(pz_norm), pat, h=H))  # [B, N_point, H, N_res, d] or [B, N_res, H, N_point, d]
         out_pat = "b p h r d -> b p r (h d)" if self.along_dim == -2 else "b r h p d -> b p r (h d)"
-        out = rearrange(torch.matmul(attn_probs, v) * gate, out_pat)
-        return self.proj_out(out)
+        out = rearrange(torch.matmul(attn_probs, v) * gate, out_pat)  # [B, N_point, N_res, c_hidden]
+        return self.proj_out(out)  # [B, N_point, N_res, c_pz]
 
 
 class PointResidueTransition(nn.Module):
@@ -586,12 +607,13 @@ class EMOuterProductMean(nn.Module):
         self.lin_out = nn.Linear(c_hidden ** 2, c_z)
 
     def forward(self, m: torch.Tensor) -> torch.Tensor:
-        m_norm = self.ln(m)
-        a = self.lin1(m_norm)
-        b = self.lin2(m_norm)
-        outer = torch.einsum("b s i c, b s j d -> b i j c d", a, b).flatten(start_dim=-2)
-        out = self.lin_out(outer) / (m.shape[1] + 1e-8)
-        return out
+        # m shape: [B, S, N, c_m]
+        m_norm = self.ln(m)  # [B, S, N, c_m]
+        a = self.lin1(m_norm)  # [B, S, N, c_hidden]
+        b = self.lin2(m_norm)  # [B, S, N, c_hidden]
+        outer = torch.einsum("b s i c, b s j d -> b i j c d", a, b).flatten(start_dim=-2)  # [B, N, N, c_hidden * c_hidden]
+        out = self.lin_out(outer) / (m.shape[1] + 1e-8)  # [B, N, N, c_z]
+        return out  # [B, N, N, c_z]
 
 
 class EMPairformerBlock(nn.Module):
@@ -621,29 +643,33 @@ class EMPairformerBlock(nn.Module):
             )
 
     def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch: bool = False) -> tuple:
+        # s shape: [B, N_res, c_s] or None
+        # z shape: [B, N_res, N_res, c_z]
+        # pz shape: [B, N_point, N_res, c_pz]
+        # p shape: [B, N_point, N_point, c_p]
         if shape_watch:
             print(f"    [Shape Watcher - EMPairformerBlock Input]\n      s={list(s.shape) if s is not None else None}, z={list(z.shape)}, pz={list(pz.shape)}, p={list(p.shape)}")
 
-        z = z + self.tri_mul_out(z)
-        z = z + self.tri_mul_in(z)
+        z = z + self.tri_mul_out(z)  # [B, N_res, N_res, c_z]
+        z = z + self.tri_mul_in(z)  # [B, N_res, N_res, c_z]
 
-        pz = pz + self.inter_outgoing(z, p)
-        pz = pz + self.inter_incoming(z, p)
-        pz = pz + self.residue_row_attn(pz, z)
-        pz = pz + self.point_column_attn(pz, p)
-        pz = pz + self.pz_transition(pz)
+        pz = pz + self.inter_outgoing(z, p)  # [B, N_point, N_res, c_pz]
+        pz = pz + self.inter_incoming(z, p)  # [B, N_point, N_res, c_pz]
+        pz = pz + self.residue_row_attn(pz, z)  # [B, N_point, N_res, c_pz]
+        pz = pz + self.point_column_attn(pz, p)  # [B, N_point, N_res, c_pz]
+        pz = pz + self.pz_transition(pz)  # [B, N_point, N_res, c_pz]
 
         # update z from pz (averaging over point axis)
-        z = z + self.outer_row_opm(pz)
+        z = z + self.outer_row_opm(pz)  # [B, N_res, N_res, c_z]
         # update p from pz (averaging over residue axis)
-        p = p + self.outer_col_opm(pz.transpose(1, 2))
-        z = z + self.transition_z(z)
+        p = p + self.outer_col_opm(pz.transpose(1, 2))  # [B, N_point, N_point, c_p]
+        z = z + self.transition_z(z)  # [B, N_res, N_res, c_z]
 
         if self.c_s > 0 and s is not None:
-            s = s + self.attn(s, z, shape_watch=shape_watch)
-            s = s + self.transition_s(s)
+            s = s + self.attn(s, z, shape_watch=shape_watch)  # [B, N_res, c_s]
+            s = s + self.transition_s(s)  # [B, N_res, c_s]
 
-        return s, z, pz, p
+        return s, z, pz, p  # shapes: ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
 
 
 class EMPairformerStack(nn.Module):
@@ -677,8 +703,8 @@ if __name__ == "__main__":
             atoms = pdbx.get_structure(pdbx.CIFFile.read(filepath), model=1)
             # 1. 3D Volumetric representations (All atoms)
             valid_atoms = atoms[np.isin(atoms.res_name, list(ALL_RESIDUES))]
-            v_coords = torch.tensor(valid_atoms.coord, dtype=torch.float32)
-            v_res_idx = torch.tensor([RESIDUE_MAP[name] for name in valid_atoms.res_name], dtype=torch.long)
+            v_coords = torch.tensor(valid_atoms.coord, dtype=torch.float32)  # [N_atoms, 3]
+            v_res_idx = torch.tensor([RESIDUE_MAP[name] for name in valid_atoms.res_name], dtype=torch.long)  # [N_atoms]
 
             # 2. 1D Sequential representations (C-alpha deduplicated)
             rep_atoms = atoms[(atoms.atom_name == "CA") | (atoms.atom_name == "C4'") | (atoms.atom_name == "P")]
@@ -690,8 +716,8 @@ if __name__ == "__main__":
                     seen.add(res_key)
                     filtered.append(idx)
             rep_atoms = rep_atoms[filtered]
-            s_seq = torch.tensor([RESIDUE_MAP.get(name, 0) for name in rep_atoms.res_name], dtype=torch.long)
-            s_coords = torch.tensor(rep_atoms.coord, dtype=torch.float32)
+            s_seq = torch.tensor([RESIDUE_MAP.get(name, 0) for name in rep_atoms.res_name], dtype=torch.long)  # [seq_len]
+            s_coords = torch.tensor(rep_atoms.coord, dtype=torch.float32)  # [seq_len, 3]
 
             all_structures[pid] = {
                 "v_coords": v_coords, "v_res_idx": v_res_idx,
@@ -742,17 +768,24 @@ if __name__ == "__main__":
         v_test = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in test_pids]
 
         # Initialize models
-        unet_atom = UNet3D(1, 1, init_features=16).to(device)
-        unet_res = UNet3D(1, len(RESIDUE_MAP) + 1, init_features=16).to(device)
+        # Initialize models
+        unet_atom = UNet3D(1, 1, init_features=16)
+        unet_res = UNet3D(1, len(RESIDUE_MAP) + 1, init_features=16)
         opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001)
         criterion_atom = BCEDiceLoss()
         criterion_res = nn.CrossEntropyLoss(ignore_index=0)
 
         def compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res):
+            # pred_atom shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            # ds_atom shape: [B, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+            # target_atoms shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            # pred_res shape: [B, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            # ds_res shape: [B, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+            # target_res shape: [B, GRID_SIZE, GRID_SIZE, GRID_SIZE]
             loss_atom_main = criterion_atom(pred_atom, target_atoms)
             loss_res_main = criterion_res(pred_res, target_res)
-            target_atoms_ds = F.max_pool3d(target_atoms, kernel_size=2, stride=2)
-            target_res_ds = F.max_pool3d(target_res.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()
+            target_atoms_ds = F.max_pool3d(target_atoms, kernel_size=2, stride=2)  # [B, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+            target_res_ds = F.max_pool3d(target_res.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()  # [B, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
             loss_atom_ds = criterion_atom(ds_atom, target_atoms_ds)
             loss_res_ds = criterion_res(ds_res, target_res_ds)
             return loss_atom_main + loss_res_main + 0.5 * (loss_atom_ds + loss_res_ds)
@@ -767,15 +800,15 @@ if __name__ == "__main__":
             epoch_loss = 0.0
             for _ in range(steps_per_epoch):
                 samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
-                inputs = torch.stack([s[0] for s in samples]).unsqueeze(1).to(device)
-                target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1).to(device)
-                target_res = torch.stack([s[2] for s in samples]).long().to(device)
+                inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                target_res = torch.stack([s[2] for s in samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)
+                inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)  # shapes same as above
 
                 opt_unet.zero_grad()
-                pred_atom, ds_atom = unet_atom(inputs, return_ds=True)
-                pred_res, ds_res = unet_res(inputs, return_ds=True)
+                pred_atom, ds_atom = unet_atom(inputs, return_ds=True)  # pred_atom: [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_atom: [4, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+                pred_res, ds_res = unet_res(inputs, return_ds=True)  # pred_res: [4, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_res: [4, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
 
                 loss = compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res)
                 loss.backward()
@@ -791,12 +824,12 @@ if __name__ == "__main__":
                     val_steps = 1 if device.type == "cpu" else 5
                     for _ in range(val_steps):
                         val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
-                        val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1).to(device)
-                        val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1).to(device)
-                        val_target_res = torch.stack([s[2] for s in val_samples]).long().to(device)
+                        val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                        val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                        val_target_res = torch.stack([s[2] for s in val_samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                        val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)
-                        val_pred_res, val_ds_res = unet_res(val_inputs, return_ds=True)
+                        val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)  # shapes same as above
+                        val_pred_res, val_ds_res = unet_res(val_inputs, return_ds=True)  # shapes same as above
                         val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res).item()
                     val_loss /= val_steps
 
@@ -815,7 +848,10 @@ if __name__ == "__main__":
         # Test Evaluation for this fold
         print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
         unet_atom.eval(); unet_res.eval()
-        peak_finder = BatchedMeanShiftPeakFinder3D().to(device)
+        # Test Evaluation for this fold
+        print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
+        unet_atom.eval(); unet_res.eval()
+        peak_finder = BatchedMeanShiftPeakFinder3D()
 
         fold_pdb_results = []
         num_test_crops = 1 if device.type == "cpu" else 10  # 10 random crops per unseen test target
@@ -829,29 +865,29 @@ if __name__ == "__main__":
                 for _ in range(num_test_crops):
                     test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
                         test_target_structure, is_training=False, return_coords=True
-                    )
-                    test_in_batch = test_input.unsqueeze(0).unsqueeze(0).to(device)
+                    )  # test_input: [GRID_SIZE, GRID_SIZE, GRID_SIZE], gt_coords: [N_cropped, 3], gt_res_indices: [N_cropped]
+                    test_in_batch = test_input.unsqueeze(0).unsqueeze(0)  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                    pred_density = F.relu(unet_atom(test_in_batch))
-                    pred_coords, _, pred_mask = peak_finder(pred_density)
-                    pred_res_logits = unet_res(test_in_batch)
+                    pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    pred_coords, _, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_mask: [1, M]
+                    pred_res_logits = unet_res(test_in_batch)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                    pred_coords = pred_coords[0].cpu()
-                    num_pred_peaks = pred_mask[0].sum().item()
+                    pred_coords = pred_coords[0].cpu()  # [M, 3]
+                    num_pred_peaks = pred_mask[0].sum().item()  # scaler
 
                     pid_resolved_peaks += num_pred_peaks
                     pid_gt_atoms += len(gt_coords)
 
                     if num_pred_peaks > 0 and len(gt_coords) > 0:
-                        dists = torch.cdist(gt_coords.cpu(), pred_coords[:num_pred_peaks])
+                        dists = torch.cdist(gt_coords.cpu(), pred_coords[:num_pred_peaks])  # [N_cropped, num_pred_peaks]
                         row_ind, col_ind = linear_sum_assignment(dists.numpy())
                         for r, c in zip(row_ind, col_ind):
                             dist = dists[r, c].item()
                             if dist <= MATCHING_RADIUS:
                                 pid_matched_atoms += 1
-                                p_coord = pred_coords[c]
-                                grid_idx = torch.clamp(torch.round(p_coord / spacing).long(), 0, GRID_SIZE - 1)
-                                logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]
+                                p_coord = pred_coords[c]  # [3]
+                                grid_idx = torch.clamp(torch.round(p_coord / spacing).long(), 0, GRID_SIZE - 1)  # [3]
+                                logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]  # [C_res]
                                 if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[r].item():
                                     pid_correct_residues += 1
 
@@ -908,16 +944,16 @@ if __name__ == "__main__":
 
     pairformer = PairformerContactPredictor(
         vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
-    ).to(device)
+    )
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
     criterion_pf = nn.BCEWithLogitsLoss()
 
     # Precompute static target contacts to optimize speed and reduce lines
     pf_dataset = []
     for pid, s in all_structures.items():
-        tokens = s["s_seq"].unsqueeze(0).to(device)
-        coords = s["s_coords"].to(device)
-        target = (torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float().unsqueeze(0)
+        tokens = s["s_seq"].unsqueeze(0)  # [1, seq_len]
+        coords = s["s_coords"]  # [seq_len, 3]
+        target = (torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float().unsqueeze(0)  # [1, seq_len, seq_len]
         pf_dataset.append((tokens, target))
     pf_train = pf_dataset[:-2]
     pf_val = pf_dataset[-2:]
@@ -929,7 +965,7 @@ if __name__ == "__main__":
         train_loss = 0.0
         for tokens, target in pf_train:
             opt_pf.zero_grad()
-            loss = criterion_pf(pairformer(tokens), target)
+            loss = criterion_pf(pairformer(tokens), target)  # scaler
             loss.backward()
             opt_pf.step()
             train_loss += loss.item()
@@ -947,9 +983,9 @@ if __name__ == "__main__":
     with torch.no_grad():
         vis_key = list(all_structures.keys())[0]
         vis_s = all_structures[vis_key]
-        vis_tokens = vis_s["s_seq"].unsqueeze(0).to(device)
-        vis_pred = torch.sigmoid(pairformer(vis_tokens, shape_watch=True)).squeeze(0).cpu()
-        vis_gt = (torch.cdist(vis_s["s_coords"].unsqueeze(0), vis_s["s_coords"].unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float()
+        vis_tokens = vis_s["s_seq"].unsqueeze(0)  # [1, seq_len]
+        vis_pred = torch.sigmoid(pairformer(vis_tokens, shape_watch=True)).squeeze(0).cpu()  # [seq_len, seq_len]
+        vis_gt = (torch.cdist(vis_s["s_coords"].unsqueeze(0), vis_s["s_coords"].unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float()  # [seq_len, seq_len]
         print(f"\nCompleted run. Contact Map ASCII Visual check for {vis_key.upper()}:")
         print_ascii_contact_map(vis_gt, vis_pred, threshold=0.5)
     print("\n" + "="*70)
@@ -964,45 +1000,46 @@ if __name__ == "__main__":
 
         # 1. Mock inputs matching physical coordinates and densities
         vocab_size = len(RESIDUE_MAP)
-        mock_tokens = torch.randint(1, vocab_size, (B, N_res), device=device)
-        mock_p_coords = torch.rand(B, N_point, 3, device=device) * DEFAULT_BOX_SIZE
-        mock_p_densities = torch.rand(B, N_point, device=device)
-        mock_res_coords = torch.rand(B, N_res, 3, device=device) * DEFAULT_BOX_SIZE
+        mock_tokens = torch.randint(1, vocab_size, (B, N_res))  # [B, N_res]
+        mock_p_coords = torch.rand(B, N_point, 3) * DEFAULT_BOX_SIZE  # [B, N_point, 3]
+        mock_p_densities = torch.rand(B, N_point)  # [B, N_point]
+        mock_res_coords = torch.rand(B, N_res, 3) * DEFAULT_BOX_SIZE  # [B, N_res, 3]
 
         # 2. Build physical representation matrices using RBF
         def mock_rbf_expansion(dists: torch.Tensor, num_centers: int = 32) -> torch.Tensor:
-            centers = torch.linspace(0.0, DEFAULT_BOX_SIZE, num_centers, device=dists.device)
+            # dists: [B, N_dim1, N_dim2]
+            centers = torch.linspace(0.0, DEFAULT_BOX_SIZE, num_centers)  # [num_centers]
             widths = DEFAULT_BOX_SIZE / num_centers
-            return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)
+            return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)  # [B, N_dim1, N_dim2, num_centers]
 
         print("  Generating geometric representation matrices...")
-        dist_pp = torch.cdist(mock_p_coords, mock_p_coords)
-        dist_pr = torch.cdist(mock_p_coords, mock_res_coords)
+        dist_pp = torch.cdist(mock_p_coords, mock_p_coords)  # [B, N_point, N_point]
+        dist_pr = torch.cdist(mock_p_coords, mock_res_coords)  # [B, N_point, N_res]
 
-        p_geom = mock_rbf_expansion(dist_pp, num_centers=c_p)
-        pz_geom = mock_rbf_expansion(dist_pr, num_centers=c_pz)
+        p_geom = mock_rbf_expansion(dist_pp, num_centers=c_p)  # [B, N_point, N_point, c_p]
+        pz_geom = mock_rbf_expansion(dist_pr, num_centers=c_pz)  # [B, N_point, N_res, c_pz]
 
         # Inject density features into point representations
-        proj_density = nn.Linear(1, c_p).to(device)
-        p = p_geom + proj_density(mock_p_densities.unsqueeze(-1)).unsqueeze(1)
-        pz = pz_geom
+        proj_density = nn.Linear(1, c_p)  # maps [B, N_point, 1] -> [B, N_point, c_p]
+        p = p_geom + proj_density(mock_p_densities.unsqueeze(-1)).unsqueeze(1)  # [B, N_point, N_point, c_p]
+        pz = pz_geom  # [B, N_point, N_res, c_pz]
 
         # Embed sequence and initialize residue pairs
-        embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0).to(device)
-        initializer = SequenceToPairInitializer(c_s, c_z, MAX_REL_POS).to(device)
+        embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
+        initializer = SequenceToPairInitializer(c_s, c_z, MAX_REL_POS)
 
-        s = embedding(mock_tokens)
-        z = initializer(s)
+        s = embedding(mock_tokens)  # [B, N_res, c_s]
+        z = initializer(s)  # [B, N_res, N_res, c_z]
 
         # 3. Instantiate EMPairformerStack
         print("  Instantiating EMPairformerStack...")
-        em_pairformer = EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4).to(device)
+        em_pairformer = EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4)
         em_pairformer.eval()
 
         # 4. Forward pass under dynamic Shape Watcher
         print("  Running EM-Pairformer forward pass:")
         with torch.no_grad():
-            s_out, z_out, pz_out, p_out = em_pairformer(s, z, pz, p, shape_watch_first=True)
+            s_out, z_out, pz_out, p_out = em_pairformer(s, z, pz, p, shape_watch_first=True)  # shapes: ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
 
         print("\n  [EM-Pairformer Output Shapes Verification]")
         print(f"    Sequence Feature (s): {list(s_out.shape)} (Expected: [1, 20, 64])")

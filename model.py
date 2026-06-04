@@ -236,13 +236,11 @@ class UNet3D(nn.Module):
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Expecting density shape: [B, 1, X, X, X]
-        B, _, X, _, _ = density.shape
+        B, _, X, _, _ = density.shape # [B, 1, X, X, X]
         M = DEFAULT_MAX_PEAKS
         spacing = DEFAULT_BOX_SIZE / (X - 1)
 
         ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X)  # [X]
-        # Using indexing='ij' ensures alignment with 3D array dimensions (Z, Y, X)
         grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)  # [X^3, 3]
 
         # 1. Local Maxima Detection
@@ -275,7 +273,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         weights_grid = torch.where(density_flat > DEFAULT_PEAK_THRESHOLD, density_flat, 0.0)  # [B, X^3]
         grid_sq = torch.sum(grid ** 2, dim=-1) # (X^3,)  # [X^3]
 
-        # Batched Mean-Shift Iteration using dense grid
+        # 2. Batched Mean-Shift Iteration using dense grid
         # Bypasses dynamic extraction and padding to avoid CPU-GPU sync.
         seeds = padded_seeds  # [B, M, 3]
         for _ in range(DEFAULT_PEAK_ITERATIONS):
@@ -324,7 +322,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         return out_coords, out_vals, out_mask
 
 # ==============================================================================
-# SECTION 4: THE PAIRFORMER ARCHITECTURE (Lecture 3)
+# SECTION 4: THE PAIRFORMER ARCHITECTURE
 # ==============================================================================
 
 class RelativePositionEmbedding(nn.Module):
@@ -508,7 +506,7 @@ def print_ascii_contact_map(gt: torch.Tensor, pred: torch.Tensor, threshold: flo
 
 
 # ==============================================================================
-# SECTION 4B: THE EM-PAIRFORMER ARCHITECTURE (CryoZeta)
+# SECTION 4B: THE EM-PAIRFORMER ARCHITECTURE
 # ==============================================================================
 
 class InterMultiplicativeUpdate(nn.Module):
@@ -724,7 +722,7 @@ if __name__ == "__main__":
             print(f"Failed to load PDB {pid}: {e}")
 
     # --------------------------------------------------------------------------
-    # DEMO 1: 5-FOLD 3D VOLUMETRIC U-NET CROSS-VALIDATION (LECTURE 2)
+    # DEMO 1: 5-FOLD 3D VOLUMETRIC U-NET CROSS-VALIDATION
     # --------------------------------------------------------------------------
     print("\n" + "="*70)
     print(" PIPELINE 1: TRAINING 5-FOLD VOLUMETRIC U-NET DEMO ")
@@ -765,9 +763,8 @@ if __name__ == "__main__":
         v_test = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in test_pids]
 
         # Initialize models
-        # Initialize models
-        unet_atom = UNet3D(1, 1, init_features=16)
-        unet_res = UNet3D(1, len(RESIDUE_MAP) + 1, init_features=16)
+        unet_atom = torch.compile(UNet3D(1, 1, init_features=16))
+        unet_res = torch.compile(UNet3D(1, len(RESIDUE_MAP) + 1, init_features=16))
         opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001)
         criterion_atom = BCEDiceLoss()
         criterion_res = nn.CrossEntropyLoss(ignore_index=0)
@@ -933,15 +930,15 @@ if __name__ == "__main__":
     print("="*85 + "\n")
 
     # --------------------------------------------------------------------------
-    # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION (LECTURE 3)
+    # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION
     # --------------------------------------------------------------------------
     print("\n" + "="*70)
     print(" PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION ")
     print("="*70)
 
-    pairformer = PairformerContactPredictor(
+    pairformer = torch.compile(PairformerContactPredictor(
         vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
-    )
+    ))
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
     criterion_pf = nn.BCEWithLogitsLoss()
 
@@ -986,7 +983,7 @@ if __name__ == "__main__":
         print(f"\nCompleted run. Contact Map ASCII Visual check for {vis_key.upper()}:")
         print_ascii_contact_map(vis_gt, vis_pred, threshold=0.5)
     print("\n" + "="*70)
-    print(" PIPELINE 3: MATHEMATICAL DYNAMIC SHAPE WATCHING OF CRYOMAP EM-PAIRFORMER ")
+    print(" PIPELINE 3: MATHEMATICAL DYNAMIC SHAPE WATCHING OF EM-PAIRFORMER ")
     print("="*70)
 
     # Shape watcher unit tests for the EM-Pairformer (The Karpathy Touch!)
@@ -1030,7 +1027,7 @@ if __name__ == "__main__":
 
         # 3. Instantiate EMPairformerStack
         print("  Instantiating EMPairformerStack...")
-        em_pairformer = EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4)
+        em_pairformer = torch.compile(EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4))
         em_pairformer.eval()
 
         # 4. Forward pass under dynamic Shape Watcher

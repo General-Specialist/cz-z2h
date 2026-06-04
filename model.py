@@ -17,7 +17,7 @@ from einops import rearrange
 # ==============================================================================
 
 RANDOM_SEED = 42
-DEFAULT_SAVE_DIR = "./pdb_data"
+SAVE_DIR = "./pdb_data"
 
 PROTEIN_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
@@ -31,14 +31,14 @@ RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(sorted(list(ALL_RESIDUES))
 PDB_IDS = ["1ubq", "1pga", "1shg", "1csp", "1a70", "1crn", "2cro", "1acx"]
 
 GRID_SIZE = 64
-DEFAULT_BOX_SIZE = 32.0
-DEFAULT_RADIUS = 1.5
+BOX_SIZE = 32.0
+RADIUS = 1.5
 
 # Mean-Shift Peak Finding Constants
-DEFAULT_PEAK_THRESHOLD = 0.30
-DEFAULT_PEAK_BANDWIDTH = 1.0
-DEFAULT_MAX_PEAKS = 128
-DEFAULT_PEAK_ITERATIONS = 5
+PEAK_THRESHOLD = 0.30
+PEAK_BANDWIDTH = 1.0
+MAX_PEAKS = 128
+PEAK_ITERATIONS = 5
 CLASH_LIMIT = 0.6
 
 # Pairformer Hyperparameters
@@ -58,7 +58,7 @@ print(f"Using device: {device}")
 # ==============================================================================
 
 def download_pdb_cif(pdb_id: str) -> str:
-    path = rcsb.fetch(pdb_id, "cif", DEFAULT_SAVE_DIR)
+    path = rcsb.fetch(pdb_id, "cif", SAVE_DIR)
     if isinstance(path, list):
         return str(path[0])
     return str(path)
@@ -70,7 +70,7 @@ def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: 
     """
     # coords shape: [N_atoms, 3]
     # res_indices shape: [N_atoms] (long)
-    ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, GRID_SIZE)  # [GRID_SIZE]
+    ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)  # [GRID_SIZE]
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')  # each [GRID_SIZE, GRID_SIZE, GRID_SIZE]
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)  # [GRID_SIZE^3, 3]
 
@@ -90,7 +90,7 @@ def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, retu
     coords, res_indices = random.choice(structures)  # coords: [N_atoms, 3], res_indices: [N_atoms] (long)
     center = coords[torch.randint(0, len(coords), (1,))].squeeze(0)  # [3]
 
-    half_box = DEFAULT_BOX_SIZE / 2.0
+    half_box = BOX_SIZE / 2.0
     mask = torch.all((coords >= center - half_box) & (coords <= center + half_box), dim=-1)  # [N_atoms] (bool)
 
     cropped_coords = coords[mask] - center + half_box  # [N_cropped, 3]
@@ -99,7 +99,7 @@ def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, retu
     sigma = random.uniform(0.8, 1.8) if is_training else 1.2
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
 
-    density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=DEFAULT_RADIUS)
+    density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=RADIUS)
 
     out_density = F.relu(density + torch.randn_like(density) * noise)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
     if return_coords:
@@ -236,88 +236,53 @@ class UNet3D(nn.Module):
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, _, X, _, _ = density.shape # [B, 1, X, X, X]
-        M = DEFAULT_MAX_PEAKS
-        spacing = DEFAULT_BOX_SIZE / (X - 1)
+        B, _, X, _, _ = density.shape
 
-        ticks = torch.linspace(0.0, DEFAULT_BOX_SIZE, X)  # [X]
-        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)  # [X^3, 3]
+        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
+        peaks = (density == max_pooled) & (density >= PEAK_THRESHOLD)
+        peak_densities = torch.where(peaks.view(B,-1), density.view(B,-1), -1e9)
+        topk_vals, topk_indicies = torch.topk(peak_densities, k=MAX_PEAKS, dim=-1)
 
-        # 1. Local Maxima Detection
-        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)  # [B, 1, X, X, X]
-        peaks = (density == max_pooled) & (density > DEFAULT_PEAK_THRESHOLD)  # [B, 1, X, X, X] (bool)
+        ticks = torch.linspace(0.0, BOX_SIZE, X)
+        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1,3)
 
-        out_coords = torch.zeros(B, M, 3)  # [B, M, 3]
-        out_vals = torch.zeros(B, M)  # [B, M]
-        out_mask = torch.zeros(B, M, dtype=torch.bool)  # [B, M] (bool)
+        seeds_mask = topk_vals > PEAK_THRESHOLD
+        seeds = grid[topk_indicies]
+        seeds = torch.where(seeds_mask.unsqueeze(-1), seeds, 0.0)
 
-        clash_limit_sq = CLASH_LIMIT ** 2
-        inv_two_bandwidth_sq = 1.0 / (2 * DEFAULT_PEAK_BANDWIDTH ** 2)
+        bandwidth_gaussian = 1.0 / (2 * PEAK_BANDWIDTH ** 2)
+        weights_grid = torch.where(density.view(B, -1) > PEAK_THRESHOLD, density.view(B,-1), 0.0)
+        for _ in range (PEAK_ITERATIONS):
+            sq_dists = torch.cdist(seeds, grid.unsqueeze(0), p=2) ** 2
+            weights = torch.exp(-sq_dists * bandwidth_gaussian) * weights_grid.unsqueeze(1)
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-8
+            seeds = weights @ grid / denominator
 
-        # Flatten spatial dimensions
-        density_flat = density.view(B, -1)  # [B, X^3]
-        peaks_mask = peaks.view(B, -1)  # [B, X^3] (bool)
+        all_seed_dists = torch.cdist(seeds, seeds, p=2) ** 2
+        clash_matrix = torch.triu(all_seed_dists < (CLASH_LIMIT ** 2), diagonal=1)
+        keep = seeds_mask.clone()
+        for i in range(MAX_PEAKS - 1):
+            keep = keep & ~(clash_matrix[:, i, :] & keep[:, i:i+1])
 
-        # Extract top M peaks sorted by density (highest intensity first)
-        peak_densities = torch.where(peaks_mask, density_flat, -1e9)  # [B, X^3]
-        topk_vals, topk_indices = torch.topk(peak_densities, k=M, dim=-1)  # topk_vals: [B, M], topk_indices: [B, M] (long)
+        # Vectorized Packing (Pushes kept peaks contiguously to the front)
+        keep_cum = torch.cumsum(keep.long(), dim=-1)
+        target_idx = keep_cum - 1
 
-        # A seed is valid if its value is above the peak threshold
-        seeds_mask = topk_vals > DEFAULT_PEAK_THRESHOLD  # [B, M] (bool)
+        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)
+        out_seq_idx = target_idx[b_idx_o, seq_idx_o]
 
-        # Gather coordinates corresponding to the top M peaks
-        padded_seeds = grid[topk_indices]  # [B, M, 3]
-        padded_seeds = torch.where(seeds_mask.unsqueeze(-1), padded_seeds, 0.0)  # [B, M, 3]
-
-        # Zero out weights below threshold on the dense grid to compute mean shift
-        weights_grid = torch.where(density_flat > DEFAULT_PEAK_THRESHOLD, density_flat, 0.0)  # [B, X^3]
-        grid_sq = torch.sum(grid ** 2, dim=-1) # (X^3,)  # [X^3]
-
-        # 2. Batched Mean-Shift Iteration using dense grid
-        # Bypasses dynamic extraction and padding to avoid CPU-GPU sync.
-        seeds = padded_seeds  # [B, M, 3]
-        for _ in range(DEFAULT_PEAK_ITERATIONS):
-            seeds_sq = torch.sum(seeds ** 2, dim=-1, keepdim=True)  # [B, M, 1]
-            dot_product = torch.matmul(seeds, grid.T)  # [B, M, X^3]
-
-            sq_dists = torch.clamp(seeds_sq + grid_sq.unsqueeze(0) - 2 * dot_product, min=0.0)  # [B, M, X^3]
-            weights = torch.exp(-sq_dists * inv_two_bandwidth_sq) * weights_grid.unsqueeze(1)  # [B, M, X^3]
-
-            denominator = weights.sum(dim=-1, keepdim=True) + 1e-8  # [B, M, 1]
-            seeds = torch.matmul(weights, grid) / denominator  # [B, M, 3]
-
-        # Clash Removal (Loop over constant M-1 to keep execution fully on GPU)
-        keep = seeds_mask.clone()  # [B, M] (bool)
-        for i in range(M - 1):
-            seeds_i = seeds[:, i:i+1]  # [B, 1, 3]
-            seeds_rest = seeds[:, i+1:]  # [B, M - (i+1), 3]
-
-            sq_dists = torch.sum((seeds_rest - seeds_i) ** 2, dim=-1)  # [B, M - (i+1)]
-            clash = (sq_dists < clash_limit_sq) & keep[:, i:i+1] & keep[:, i+1:]  # [B, M - (i+1)] (bool)
-            keep[:, i+1:].masked_fill_(clash, False)  # [B, M] (bool)
-
-        # Vectorized Packing to contiguous output tensors (Zero Sync Points)
-        keep_cum = torch.cumsum(keep.long(), dim=-1)  # [B, M] (long)
-        target_idx = keep_cum - 1  # [B, M] (long)
-
-        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)  # both [N_active] (long)
-        out_seq_idx = target_idx[b_idx_o, seq_idx_o]  # [N_active] (long)
-
+        out_coords = torch.zeros(B, MAX_PEAKS, 3)
         out_coords[b_idx_o, out_seq_idx] = seeds[b_idx_o, seq_idx_o]
+
+        out_mask = torch.zeros(B, MAX_PEAKS, dtype=torch.bool)
         out_mask[b_idx_o, out_seq_idx] = True
 
-        # Voxel density lookup
-        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)  # [B, M, 3] (long)
-        batch_idx = torch.arange(B).unsqueeze(1).expand(B, M)  # [B, M] (long)
+        spacing = BOX_SIZE / (X - 1)
+        coords_grid = (out_coords / spacing).round().long().clamp(0, X-1)
 
-        lookup_vals = density[
-            batch_idx,
-            0,
-            coords_grid[..., 0],
-            coords_grid[..., 1],
-            coords_grid[..., 2]
-        ]  # [B, M]
-        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)  # [B, M]
+        flat_coords = coords_grid[..., 0] * (X*X) + coords_grid[..., 1] * X + coords_grid[..., 2]
+        lookup_vals = torch.gather(density.view(B, -1), dim=-1, index=flat_coords)
+        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
 
         return out_coords, out_vals, out_mask
 
@@ -690,7 +655,7 @@ if __name__ == "__main__":
     print(" PREPARING MOLECULAR DATABASE ")
     print("===========================================================================")
 
-    os.makedirs(DEFAULT_SAVE_DIR, exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
     all_structures = {}
     for pid in tqdm(PDB_IDS, desc="Caching mmCIF files"):
         filepath = download_pdb_cif(pid)
@@ -732,7 +697,7 @@ if __name__ == "__main__":
     NUM_EPOCHS = 1 if device.type == "cpu" else 100
     steps_per_epoch = 1 if device.type == "cpu" else 25
     MATCHING_RADIUS = 1.5
-    spacing = DEFAULT_BOX_SIZE / (GRID_SIZE - 1)
+    spacing = BOX_SIZE / (GRID_SIZE - 1)
 
     # Initialize 5 folds on the 8 PDBs using scikit-learn
     kf = KFold(n_splits=K_FOLDS, shuffle=True, random_state=RANDOM_SEED)
@@ -995,15 +960,15 @@ if __name__ == "__main__":
         # 1. Mock inputs matching physical coordinates and densities
         vocab_size = len(RESIDUE_MAP)
         mock_tokens = torch.randint(1, vocab_size, (B, N_res))  # [B, N_res] (long)
-        mock_p_coords = torch.rand(B, N_point, 3) * DEFAULT_BOX_SIZE  # [B, N_point, 3]
+        mock_p_coords = torch.rand(B, N_point, 3) * BOX_SIZE  # [B, N_point, 3]
         mock_p_densities = torch.rand(B, N_point)  # [B, N_point]
-        mock_res_coords = torch.rand(B, N_res, 3) * DEFAULT_BOX_SIZE  # [B, N_res, 3]
+        mock_res_coords = torch.rand(B, N_res, 3) * BOX_SIZE  # [B, N_res, 3]
 
         # 2. Build physical representation matrices using RBF
         def mock_rbf_expansion(dists: torch.Tensor, num_centers: int = 32) -> torch.Tensor:
             # dists: [B, N_dim1, N_dim2]
-            centers = torch.linspace(0.0, DEFAULT_BOX_SIZE, num_centers)  # [num_centers]
-            widths = DEFAULT_BOX_SIZE / num_centers
+            centers = torch.linspace(0.0, BOX_SIZE, num_centers)  # [num_centers]
+            widths = BOX_SIZE / num_centers
             return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)  # [B, N_dim1, N_dim2, num_centers]
 
         print("  Generating geometric representation matrices...")

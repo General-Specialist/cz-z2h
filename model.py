@@ -238,38 +238,45 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, _, X, _, _ = density.shape
 
-        max_pooled = F.max_pool3d(density, kernel_size=3, stride=1, padding=1)
-        peaks = (density == max_pooled) & (density >= PEAK_THRESHOLD)
-        peak_densities = torch.where(peaks.view(B,-1), density.view(B,-1), -1e9)
-        topk_vals, topk_indicies = torch.topk(peak_densities, k=MAX_PEAKS, dim=-1)
+        # 1. Find local maximum seeds
+        density_pooled = F.max_pool3d(density, kernel_size=3, padding=1, stride=1)
+        density_seeds_only = torch.where((density_pooled == density) & (density >= PEAK_THRESHOLD), density, -1e9)
 
-        ticks = torch.linspace(0.0, BOX_SIZE, X)
-        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1,3)
+        # 2. Find global peaks across the 3D grid
+        top_vals, top_idx = torch.topk(density_seeds_only.view(B, -1), k=MAX_PEAKS, dim=-1)
 
-        seeds_mask = topk_vals > PEAK_THRESHOLD
-        seeds = grid[topk_indicies]
+        # 3. Create the 3D coordinate grid
+        ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)
+        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)
+
+        # 4. Map top indices to 3D grid coordinates
+        seeds_mask = top_vals > PEAK_THRESHOLD
+        seeds = grid[top_idx]  # Shape: [B, MAX_PEAKS, 3]
         seeds = torch.where(seeds_mask.unsqueeze(-1), seeds, 0.0)
 
         bandwidth_gaussian = 1.0 / (2 * PEAK_BANDWIDTH ** 2)
-        weights_grid = torch.where(density.view(B, -1) > PEAK_THRESHOLD, density.view(B,-1), 0.0)
-        for _ in range (PEAK_ITERATIONS):
+        weights_grid = torch.where(density.view(B, -1) > PEAK_THRESHOLD, density.view(B, -1), 0.0)
+
+        # 5. Peak shifting (Mean-Shift iterations)
+        for _ in range(PEAK_ITERATIONS):
             sq_dists = torch.cdist(seeds, grid.unsqueeze(0), p=2) ** 2
             weights = torch.exp(-sq_dists * bandwidth_gaussian) * weights_grid.unsqueeze(1)
-            denominator = weights.sum(dim=-1, keepdim=True) + 1e-8
-            seeds = weights @ grid / denominator
+            seeds = weights @ grid / (weights.sum(dim=-1, keepdim=True) + 1e-8)
 
-        all_seed_dists = torch.cdist(seeds, seeds, p=2) ** 2
-        clash_matrix = torch.triu(all_seed_dists < (CLASH_LIMIT ** 2), diagonal=1)
+        # 6. Purge duplicate peaks that converged to the same location
+        seed_dists = torch.cdist(seeds, seeds, p=2) ** 2
+        clash_matrix = torch.triu(seed_dists < (CLASH_LIMIT ** 2), diagonal=1)
+
         keep = seeds_mask.clone()
         for i in range(MAX_PEAKS - 1):
             keep = keep & ~(clash_matrix[:, i, :] & keep[:, i:i+1])
 
-        # Vectorized Packing (Pushes kept peaks contiguously to the front)
+        # 7. Push kept peaks contiguously to the front of the array (Vectorized Packing)
         keep_cum = torch.cumsum(keep.long(), dim=-1)
-        target_idx = keep_cum - 1
+        target_peaks_idx = keep_cum - 1
 
         b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)
-        out_seq_idx = target_idx[b_idx_o, seq_idx_o]
+        out_seq_idx = target_peaks_idx[b_idx_o, seq_idx_o]
 
         out_coords = torch.zeros(B, MAX_PEAKS, 3)
         out_coords[b_idx_o, out_seq_idx] = seeds[b_idx_o, seq_idx_o]
@@ -278,9 +285,10 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         out_mask[b_idx_o, out_seq_idx] = True
 
         spacing = BOX_SIZE / (X - 1)
-        coords_grid = (out_coords / spacing).round().long().clamp(0, X-1)
+        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)
 
-        flat_coords = coords_grid[..., 0] * (X*X) + coords_grid[..., 1] * X + coords_grid[..., 2]
+        # Flatten coords to lookup original densities
+        flat_coords = coords_grid[..., 0] * (X * X) + coords_grid[..., 1] * X + coords_grid[..., 2]
         lookup_vals = torch.gather(density.view(B, -1), dim=-1, index=flat_coords)
         out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
 

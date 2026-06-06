@@ -414,14 +414,10 @@ class PairformerBlock(nn.Module):
         super().__init__()
         self.attn = BiasedAttention(c_s, c_z, c_s, n_heads, along_dim=-2)
         self.ln_s1 = nn.LayerNorm(c_s)
-        self.transition_s = nn.Sequential(
-            nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
-        )
+        self.transition_s = TransitionBlock(c_s, act_fn="gelu")
         self.opm = OuterProduct(c_s, c_z)
         self.tri_mul = TriangleUpdate(c_z)
-        self.transition_z = nn.Sequential(
-            nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
-        )
+        self.transition_z = TransitionBlock(c_z, act_fn="gelu")
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         # s shape: [B, N, c_s]
@@ -527,22 +523,16 @@ class EMBlock(nn.Module):
 
         self.residue_row_attn = BiasedAttention(c_pz, c_z, c_pz, n_heads=n_heads, along_dim=-2, has_norms=True)
         self.point_column_attn = BiasedAttention(c_pz, c_p, c_pz, n_heads=n_heads, along_dim=-3, has_norms=True)
-        self.pz_transition = nn.Sequential(
-            nn.LayerNorm(c_pz), nn.Linear(c_pz, 4 * c_pz), nn.ReLU(), nn.Linear(4 * c_pz, c_pz)
-        )
+        self.pz_transition = TransitionBlock(c_pz, act_fn="relu")
 
         self.outer_row_opm = OuterProduct(c_pz, c_z, c_hidden=16)
         self.outer_col_opm = OuterProduct(c_pz, c_p, c_hidden=16)
 
-        self.transition_z = nn.Sequential(
-            nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
-        )
+        self.transition_z = TransitionBlock(c_z, act_fn="gelu")
         self.c_s = c_s
         if c_s > 0:
             self.attn = BiasedAttention(c_s, c_z, c_s, n_heads)
-            self.transition_s = nn.Sequential(
-                nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
-            )
+            self.transition_s = TransitionBlock(c_s, act_fn="gelu")
 
     def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch: bool = False) -> tuple:
         # s shape: [B, N_res, c_s] or None
@@ -747,9 +737,6 @@ if __name__ == "__main__":
             unet_atom.load_state_dict({k: v.to(device) for k, v in best_atom_state.items()})
             unet_res.load_state_dict({k: v.to(device) for k, v in best_res_state.items()})
 
-        # Test Evaluation for this fold
-        print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
-        unet_atom.eval(); unet_res.eval()
         # Test Evaluation for this fold
         print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
         unet_atom.eval(); unet_res.eval()

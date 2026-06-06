@@ -235,7 +235,7 @@ class UNet3D(nn.Module):
 # ==============================================================================
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
-    def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, _, X, _, _ = density.shape
 
         # 1. Find local maximum seeds
@@ -284,7 +284,15 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         out_mask = torch.zeros(B, MAX_PEAKS, dtype=torch.bool)
         out_mask[b_idx_o, out_seq_idx] = True
 
-        return out_coords, out_mask
+        spacing = BOX_SIZE / (X - 1)
+        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)
+
+        # Flatten coords to lookup original densities
+        flat_coords = coords_grid[..., 0] * (X * X) + coords_grid[..., 1] * X + coords_grid[..., 2]
+        lookup_vals = torch.gather(density.view(B, -1), dim=-1, index=flat_coords)
+        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
+
+        return out_coords, out_vals, out_mask
 
 # ==============================================================================
 # SECTION 4: THE PAIRFORMER ARCHITECTURE
@@ -828,7 +836,7 @@ if __name__ == "__main__":
                     test_in_batch = test_input.unsqueeze(0).unsqueeze(0)  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
                     pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                    pred_coords, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_mask: [1, M] (bool)
+                    pred_coords, pred_vals, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_vals: [1, M], pred_mask: [1, M] (bool)
                     pred_res_logits = unet_res(test_in_batch)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
                     pred_coords_gpu = pred_coords[0]  # [M, 3]
@@ -852,14 +860,20 @@ if __name__ == "__main__":
 
             avg_peaks_per_crop = pid_resolved_peaks / num_test_crops
             recovery_pct = (pid_matched_atoms / pid_gt_atoms) * 100 if pid_gt_atoms > 0 else 0.0
+            precision_pct = (pid_matched_atoms / pid_resolved_peaks) * 100 if pid_resolved_peaks > 0 else 0.0
+            f1_pct = 2 * (precision_pct * recovery_pct) / (precision_pct + recovery_pct) if (precision_pct + recovery_pct) > 0 else 0.0
             class_pct = (pid_correct_residues / pid_matched_atoms) * 100 if pid_matched_atoms > 0 else 0.0
 
-            print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Classification: {class_pct:.1f}%")
+            print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Precision: {precision_pct:.1f}% | F1: {f1_pct:.1f}% | Classification: {class_pct:.1f}%")
+            print(f"    Confusion Matrix (2x2):")
+            print(f"                 Actual Atom   Actual Space")
+            print(f"      Pred Peak    TP: {pid_matched_atoms:<5}     FP: {pid_resolved_peaks - pid_matched_atoms:<5}")
+            print(f"      No Peak      FN: {pid_gt_atoms - pid_matched_atoms:<5}     TN: N/A")
 
             result_entry = {
                 "fold": fold_idx + 1, "pid": pid.upper(), "avg_peaks": avg_peaks_per_crop,
                 "gt_atoms": pid_gt_atoms, "matched_atoms": pid_matched_atoms,
-                "recovery_pct": recovery_pct, "class_pct": class_pct
+                "recovery_pct": recovery_pct, "precision_pct": precision_pct, "f1_pct": f1_pct, "class_pct": class_pct
             }
             fold_pdb_results.append(result_entry)
             all_folds_pdb_results.append(result_entry)
@@ -878,21 +892,23 @@ if __name__ == "__main__":
     # --------------------------------------------------------------------------
     # FINAL CONSOLIDATED CROSS-VALIDATION REPORT
     # --------------------------------------------------------------------------
-    print("\n" + "="*85)
+    print("\n" + "="*105)
     print(" FINAL 5-FOLD CROSS-VALIDATION SUMMARY TABLE ")
-    print("="*85)
-    print(" Fold | PDB ID  | Resolved/Crop | Total Atoms | Recovery % | Classification %")
-    print("-" * 85)
+    print("="*105)
+    print(" Fold | PDB ID  | Resolved/Crop | Total Atoms | Recovery % | Precision % | F1 % | Classification %")
+    print("-" * 105)
     for res in all_folds_pdb_results:
-        print(f"  {res['fold']:<3} | {res['pid']:<7} | {res['avg_peaks']:<13.1f} | {res['gt_atoms']:<11} | {res['recovery_pct']:<10.1f}% | {res['class_pct']:<16.1f}%")
-    print("-" * 85)
+        print(f"  {res['fold']:<3} | {res['pid']:<7} | {res['avg_peaks']:<13.1f} | {res['gt_atoms']:<11} | {res['recovery_pct']:<10.1f}% | {res['precision_pct']:<11.1f}% | {res['f1_pct']:<4.1f}% | {res['class_pct']:<16.1f}%")
+    print("-" * 105)
 
     global_avg_peaks = global_resolved_peaks / global_num_crops if global_num_crops > 0 else 0.0
     global_recovery = (global_matched_atoms / global_gt_atoms) * 100 if global_gt_atoms > 0 else 0.0
+    global_precision = (global_matched_atoms / global_resolved_peaks) * 100 if global_resolved_peaks > 0 else 0.0
+    global_f1 = 2 * (global_precision * global_recovery) / (global_precision + global_recovery) if (global_precision + global_recovery) > 0 else 0.0
     global_classification = (global_correct_residues / global_matched_atoms) * 100 if global_matched_atoms > 0 else 0.0
 
-    print(f" {'OVERALL':<7} | {'ALL':<7} | {global_avg_peaks:<13.1f} | {global_gt_atoms:<11} | {global_recovery:<10.1f}% | {global_classification:<16.1f}%")
-    print("="*85 + "\n")
+    print(f" {'OVERALL':<7} | {'ALL':<7} | {global_avg_peaks:<13.1f} | {global_gt_atoms:<11} | {global_recovery:<10.1f}% | {global_precision:<11.1f}% | {global_f1:<4.1f}% | {global_classification:<16.1f}%")
+    print("="*105 + "\n")
 
     # --------------------------------------------------------------------------
     # DEMO 2: PAIRFORMER SEQUENCE-TO-PAIR OPTIMIZATION

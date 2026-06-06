@@ -239,31 +239,26 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         B, _, X, _, _ = density.shape
 
         # 1. Find local maximum seeds
-        density_pooled = F.max_pool3d(density, kernel_size=3, padding=1, stride=1)
-        density_seeds_only = torch.where((density_pooled == density) & (density >= PEAK_THRESHOLD), density, -1e9)
+        density_seeds_only = torch.where(F.max_pool3d(density, kernel_size=3, padding=1, stride=1) == density, density, -1e9) # Is it a peak?
+        top_vals, top_idx = torch.topk(density_seeds_only.view(B, -1), k=MAX_PEAKS, dim=-1) # Find top k peaks
+        seeds_mask = top_vals > PEAK_THRESHOLD # Make sure it meets the threshold
 
-        # 2. Find global peaks across the 3D grid
-        top_vals, top_idx = torch.topk(density_seeds_only.view(B, -1), k=MAX_PEAKS, dim=-1)
-
-        # 3. Create the 3D coordinate grid
+        # Create the 3D coordinate grid and map top indices to 3D grid coordinates
         ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)
         grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)
-
-        # 4. Map top indices to 3D grid coordinates
-        seeds_mask = top_vals > PEAK_THRESHOLD
-        seeds = grid[top_idx]  # Shape: [B, MAX_PEAKS, 3]
-        seeds = torch.where(seeds_mask.unsqueeze(-1), seeds, 0.0)
+        seeds = grid[top_idx]
+        seeds.masked_fill_(~seeds_mask.unsqueeze(-1), 0.0)
 
         bandwidth_gaussian = 1.0 / (2 * PEAK_BANDWIDTH ** 2)
         weights_grid = torch.where(density.view(B, -1) > PEAK_THRESHOLD, density.view(B, -1), 0.0)
 
-        # 5. Peak shifting (Mean-Shift iterations)
+        # 2. Mean peak shift
         for _ in range(PEAK_ITERATIONS):
             sq_dists = torch.cdist(seeds, grid.unsqueeze(0), p=2) ** 2
             weights = torch.exp(-sq_dists * bandwidth_gaussian) * weights_grid.unsqueeze(1)
             seeds = weights @ grid / (weights.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # 6. Purge duplicate peaks that converged to the same location
+        # Purge duplicate peaks that converged to the same location
         seed_dists = torch.cdist(seeds, seeds, p=2) ** 2
         clash_matrix = torch.triu(seed_dists < (CLASH_LIMIT ** 2), diagonal=1)
 
@@ -271,7 +266,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         for i in range(MAX_PEAKS - 1):
             keep = keep & ~(clash_matrix[:, i, :] & keep[:, i:i+1])
 
-        # 7. Push kept peaks contiguously to the front of the array (Vectorized Packing)
+        # Push kept peaks contiguously to the front of the array (Vectorized Packing)
         keep_cum = torch.cumsum(keep.long(), dim=-1)
         target_peaks_idx = keep_cum - 1
 

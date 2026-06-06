@@ -293,91 +293,95 @@ class PeakFinder(nn.Module):
 # SECTION 4: THE PAIRFORMER ARCHITECTURE
 # ==============================================================================
 
-class RelPosEmbedding(nn.Module):
-    def __init__(self, max_rel_pos: int = 32, c_z: int = 32):
-        super().__init__()
-        self.max_rel_pos = max_rel_pos
-        self.num_bins = 2 * max_rel_pos + 1
-        self.emb = nn.Embedding(self.num_bins, c_z)
-
-    def forward(self, seq_len: int) -> torch.Tensor:
-        pos = torch.arange(seq_len)  # [seq_len] (long)
-        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # [seq_len, seq_len] (long)
-        return self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)  # [seq_len, seq_len, c_z]
-
-
 class SeqToPair(nn.Module):
     def __init__(self, c_s: int, c_z: int, max_rel_pos: int = 32):
         super().__init__()
         self.linear_s_q = nn.Linear(c_s, c_z)
         self.linear_s_k = nn.Linear(c_s, c_z)
-        self.rel_pos = RelPosEmbedding(max_rel_pos, c_z)
+        self.max_rel_pos = max_rel_pos
+        self.emb = nn.Embedding(2 * max_rel_pos + 1, c_z)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         # s shape: [B, seq_len, c_s]
         s_q = self.linear_s_q(s).unsqueeze(2)  # [B, seq_len, 1, c_z]
         s_k = self.linear_s_k(s).unsqueeze(1)  # [B, 1, seq_len, c_z]
-        return s_q + s_k + self.rel_pos(s.shape[1]).unsqueeze(0)  # [B, seq_len, seq_len, c_z]
+        pos = torch.arange(s.shape[1])
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)
+        rel_pos = self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)
+        return s_q + s_k + rel_pos.unsqueeze(0)  # [B, seq_len, seq_len, c_z]
 
 
-class PairAttention(nn.Module):
-    def __init__(self, c_s: int, c_z: int, n_heads: int = 4):
+class BiasedAttention(nn.Module):
+    def __init__(self, c_in: int, c_bias: int, c_hidden: int, n_heads: int = 4, along_dim: int = -2, has_norms: bool = False):
         super().__init__()
         self.n_heads = n_heads
-        self.c_s = c_s
-        self.d_k = c_s // n_heads
-        self.proj_q = nn.Linear(c_s, c_s, bias=False)
-        self.proj_k = nn.Linear(c_s, c_s, bias=False)
-        self.proj_v = nn.Linear(c_s, c_s, bias=False)
-        self.proj_bias = nn.Linear(c_z, n_heads, bias=False)
-        self.proj_gate = nn.Linear(c_s, c_s)
-        self.proj_out = nn.Linear(c_s, c_s)
+        self.d_k = c_hidden // n_heads
+        self.along_dim = along_dim
+        self.ln_x = nn.LayerNorm(c_in) if has_norms else nn.Identity()
+        self.ln_bias = nn.LayerNorm(c_bias) if has_norms else nn.Identity()
+        self.proj_q = nn.Linear(c_in, c_hidden, bias=False)
+        self.proj_k = nn.Linear(c_in, c_hidden, bias=False)
+        self.proj_v = nn.Linear(c_in, c_hidden, bias=False)
+        self.proj_bias = nn.Linear(c_bias, n_heads, bias=False)
+        self.proj_gate = nn.Linear(c_in, c_hidden)
+        self.proj_out = nn.Linear(c_hidden, c_in)
 
-    def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        # s shape: [B, N, c_s]
-        # z shape: [B, N, N, c_z]
-        B, N, _ = s.shape
-        H = self.n_heads
-
-        q = rearrange(self.proj_q(s), "b n (h d) -> b h n d", h=H)  # [B, H, N, d_k]
-        k = rearrange(self.proj_k(s), "b n (h d) -> b h n d", h=H)  # [B, H, N, d_k]
-        v = rearrange(self.proj_v(s), "b n (h d) -> b h n d", h=H)  # [B, H, N, d_k]
-
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, H, N, N]
-        bias = rearrange(self.proj_bias(z), "b i j h -> b h i j")  # [B, H, N, N]
-
-        attn_probs = F.softmax(logits + bias, dim=-1)  # [B, H, N, N]
-        out = torch.matmul(attn_probs, v)  # [B, H, N, d_k]
-
-        gate = torch.sigmoid(rearrange(self.proj_gate(s), "b n (h d) -> b h n d", h=H))  # [B, H, N, d_k]
-        out = rearrange(out * gate, "b h n d -> b n (h d)")  # [B, N, c_s]
-
+    def forward(self, x: torch.Tensor, bias: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
+        x_norm = self.ln_x(x)
+        is_3d = x.dim() == 3
+        x_4d = x_norm.unsqueeze(1) if is_3d else (x_norm.transpose(1, 2) if self.along_dim == -3 else x_norm)
+        B, O, A, _ = x_4d.shape
+        q, k, v, g = [proj(x_4d).view(B, O, A, self.n_heads, self.d_k).transpose(2, 3) 
+                      for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
+        bias_proj = self.proj_bias(self.ln_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)
+        attn = F.softmax(logits + bias_proj, dim=-1)
+        out = (attn @ v * torch.sigmoid(g)).transpose(2, 3).reshape(B, O, A, -1)
+        out = self.proj_out(out)
+        if is_3d:
+            out = out.squeeze(1)
+        else:
+            if self.along_dim == -3:
+                out = out.transpose(1, 2)
         if shape_watch:
-            print(f"    [Shape Watcher - AttentionPairBias]\n      s={list(s.shape)}, z={list(z.shape)}, Q/K/V heads={list(q.shape)}")
-
-        return self.proj_out(out)  # [B, N, c_s]
+            print(f"    [Shape Watcher - BiasedAttention]\n      x={list(x.shape)}, bias={list(bias.shape)}, out={list(out.shape)}")
+        return out
 
 
 class OuterProduct(nn.Module):
-    def __init__(self, c_s: int, c_z: int, c_hidden: int = 16):
+    def __init__(self, c_in: int, c_out: int, c_hidden: int = 16):
         super().__init__()
-        self.ln = nn.LayerNorm(c_s)
-        self.lin1 = nn.Linear(c_s, c_hidden)
-        self.lin2 = nn.Linear(c_s, c_hidden)
-        self.lin_out = nn.Linear(c_hidden ** 2, c_z)
+        self.ln = nn.LayerNorm(c_in)
+        self.lin1 = nn.Linear(c_in, c_hidden)
+        self.lin2 = nn.Linear(c_in, c_hidden)
+        self.lin_out = nn.Linear(c_hidden ** 2, c_out)
 
-    def forward(self, s: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        # s shape: [B, N, c_s]
-        s_norm = self.ln(s)  # [B, N, c_s]
-        a = self.lin1(s_norm)  # [B, N, c_hidden]
-        b = self.lin2(s_norm)  # [B, N, c_hidden]
-        outer = rearrange(torch.einsum("b i c, b j d -> b i j c d", a, b), "b i j c d -> b i j (c d)")  # [B, N, N, c_hidden * c_hidden]
-        out = self.lin_out(outer)  # [B, N, N, c_z]
-
+    def forward(self, x: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
+        x_norm = self.ln(x)
+        a, b = self.lin1(x_norm), self.lin2(x_norm)
+        outer = torch.einsum("b ... i c, b ... j d -> b i j c d", a, b).flatten(start_dim=-2)
+        out = self.lin_out(outer)
+        if x.dim() == 4:
+            out = out / (x.shape[1] + 1e-8)
         if shape_watch:
-            print(f"    [Shape Watcher - OuterProductMean]\n      outer_flat={list(outer.shape)}, z_update={list(out.shape)}")
+            print(f"    [Shape Watcher - OuterProduct]\n      outer_flat={list(outer.shape)}, update={list(out.shape)}")
+        return out
 
-        return out  # [B, N, N, c_z]
+
+class TransitionBlock(nn.Module):
+    def __init__(self, c_in: int, n: int = 4, act_fn: str = "gelu"):
+        super().__init__()
+        act = nn.GELU() if act_fn == "gelu" else nn.ReLU()
+        self.net = nn.Sequential(
+            nn.LayerNorm(c_in),
+            nn.Linear(c_in, n * c_in),
+            act,
+            nn.Linear(n * c_in, c_in)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
 
 
 class TriangleUpdate(nn.Module):
@@ -408,7 +412,7 @@ class TriangleUpdate(nn.Module):
 class PairformerBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, n_heads: int = 4):
         super().__init__()
-        self.attn = PairAttention(c_s, c_z, n_heads)
+        self.attn = BiasedAttention(c_s, c_z, c_s, n_heads, along_dim=-2)
         self.ln_s1 = nn.LayerNorm(c_s)
         self.transition_s = nn.Sequential(
             nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
@@ -512,73 +516,6 @@ class InterUpdate(nn.Module):
         return self.lin_out(self.ln_out(out))  # [B, N_point, N_res, c_pz]
 
 
-class JointAttention(nn.Module):
-    def __init__(self, c_pz: int, c_bias: int, c_hidden: int, n_heads: int = 4, along_dim: int = -2):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_k = c_hidden // n_heads
-        self.along_dim = along_dim  # -2: row (residue), -3: column (point)
-        self.ln_pz = nn.LayerNorm(c_pz)
-        self.ln_bias = nn.LayerNorm(c_bias)
-
-        self.proj_q = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_k = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_v = nn.Linear(c_pz, c_hidden, bias=False)
-        self.proj_bias = nn.Linear(c_bias, n_heads, bias=False)
-        self.proj_gate = nn.Linear(c_pz, c_hidden)
-        self.proj_out = nn.Linear(c_hidden, c_pz)
-
-    def forward(self, pz: torch.Tensor, bias_tensor: torch.Tensor) -> torch.Tensor:
-        # pz shape: [B, N_point, N_res, c_pz]
-        # bias_tensor shape: [B, N_res, N_res, c_bias] or [B, N_point, N_point, c_bias]
-        H = self.n_heads
-        pz_norm = self.ln_pz(pz)  # [B, N_point, N_res, c_pz]
-
-        pat = "b p r (h d) -> b p h r d" if self.along_dim == -2 else "b p r (h d) -> b r h p d"
-        q, k, v = [rearrange(proj(pz_norm), pat, h=H) for proj in (self.proj_q, self.proj_k, self.proj_v)]  # each [B, N_point, H, N_res, d] or [B, N_res, H, N_point, d]
-
-        bias = rearrange(self.proj_bias(self.ln_bias(bias_tensor)), "b i j h -> b h i j").unsqueeze(1)  # [B, 1, H, N_dim, N_dim]
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, N_point, H, N_res, N_res] or [B, N_res, H, N_point, N_point]
-        attn_probs = F.softmax(logits + bias, dim=-1)  # [B, N_point, H, N_res, N_res] or [B, N_res, H, N_point, N_point]
-
-        gate = torch.sigmoid(rearrange(self.proj_gate(pz_norm), pat, h=H))  # [B, N_point, H, N_res, d] or [B, N_res, H, N_point, d]
-        out_pat = "b p h r d -> b p r (h d)" if self.along_dim == -2 else "b r h p d -> b p r (h d)"
-        out = rearrange(torch.matmul(attn_probs, v) * gate, out_pat)  # [B, N_point, N_res, c_hidden]
-        return self.proj_out(out)  # [B, N_point, N_res, c_pz]
-
-
-class PRTransition(nn.Module):
-    def __init__(self, c_pz: int, n: int = 4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(c_pz),
-            nn.Linear(c_pz, n * c_pz),
-            nn.ReLU(),
-            nn.Linear(n * c_pz, c_pz)
-        )
-
-    def forward(self, pz: torch.Tensor) -> torch.Tensor:
-        return self.net(pz)
-
-
-class EMOuterProduct(nn.Module):
-    def __init__(self, c_m: int, c_z: int, c_hidden: int = 16):
-        super().__init__()
-        self.ln = nn.LayerNorm(c_m)
-        self.lin1 = nn.Linear(c_m, c_hidden)
-        self.lin2 = nn.Linear(c_m, c_hidden)
-        self.lin_out = nn.Linear(c_hidden ** 2, c_z)
-
-    def forward(self, m: torch.Tensor) -> torch.Tensor:
-        # m shape: [B, S, N, c_m]
-        m_norm = self.ln(m)  # [B, S, N, c_m]
-        a = self.lin1(m_norm)  # [B, S, N, c_hidden]
-        b = self.lin2(m_norm)  # [B, S, N, c_hidden]
-        outer = torch.einsum("b s i c, b s j d -> b i j c d", a, b).flatten(start_dim=-2)  # [B, N, N, c_hidden * c_hidden]
-        out = self.lin_out(outer) / (m.shape[1] + 1e-8)  # [B, N, N, c_z]
-        return out  # [B, N, N, c_z]
-
-
 class EMBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, c_pz: int, c_p: int, n_heads: int = 4):
         super().__init__()
@@ -588,19 +525,21 @@ class EMBlock(nn.Module):
         self.inter_outgoing = InterUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
         self.inter_incoming = InterUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
 
-        self.residue_row_attn = JointAttention(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads, along_dim=-2)
-        self.point_column_attn = JointAttention(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads, along_dim=-3)
-        self.pz_transition = PRTransition(c_pz)
+        self.residue_row_attn = BiasedAttention(c_pz, c_z, c_pz, n_heads=n_heads, along_dim=-2, has_norms=True)
+        self.point_column_attn = BiasedAttention(c_pz, c_p, c_pz, n_heads=n_heads, along_dim=-3, has_norms=True)
+        self.pz_transition = nn.Sequential(
+            nn.LayerNorm(c_pz), nn.Linear(c_pz, 4 * c_pz), nn.ReLU(), nn.Linear(4 * c_pz, c_pz)
+        )
 
-        self.outer_row_opm = EMOuterProduct(c_pz, c_z, c_hidden=16)
-        self.outer_col_opm = EMOuterProduct(c_pz, c_p, c_hidden=16)
+        self.outer_row_opm = OuterProduct(c_pz, c_z, c_hidden=16)
+        self.outer_col_opm = OuterProduct(c_pz, c_p, c_hidden=16)
 
         self.transition_z = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
         )
         self.c_s = c_s
         if c_s > 0:
-            self.attn = PairAttention(c_s, c_z, n_heads)
+            self.attn = BiasedAttention(c_s, c_z, c_s, n_heads)
             self.transition_s = nn.Sequential(
                 nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
             )
@@ -644,6 +583,7 @@ class EMPairformer(nn.Module):
         for i, block in enumerate(self.blocks):
             s, z, pz, p = block(s, z, pz, p, shape_watch=(shape_watch_first and i == 0))
         return s, z, pz, p
+
 
 # ==============================================================================
 # SECTION 5: K-FOLD AND GOOGLE COLAB TRAINING PIPELINE

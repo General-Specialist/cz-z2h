@@ -145,7 +145,7 @@ def find_groups(c: int) -> int:
     return 1
 
 
-class ConvBlock3d(nn.Module):
+class ConvBlock(nn.Module):
     def __init__(self, in_c: int, out_c: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -161,7 +161,7 @@ class ConvBlock3d(nn.Module):
         return self.skip(x) + self.net(x)  # returns [B, out_c, H, W, D]
 
 
-class SpatialTransformerBlock3d(nn.Module):
+class SpatialTransformer(nn.Module):
     def __init__(self, channels: int, n_heads: int):
         super().__init__()
         self.norm = nn.GroupNorm(find_groups(channels), channels)
@@ -186,25 +186,25 @@ class SpatialTransformerBlock3d(nn.Module):
         return h_in + self.proj_out(x)  # [B, channels, H, W, D]
 
 
-class UNet3D(nn.Module):
+class UNet(nn.Module):
     def __init__(self, in_channels: int = 1, out_channels: int = 1, init_features: int = 32) -> None:
         super().__init__()
         f = init_features
-        self.down1 = ConvBlock3d(in_channels, f)
+        self.down1 = ConvBlock(in_channels, f)
         self.pool1 = nn.Conv3d(f, f, 3, stride=2, padding=1)
-        self.down2 = ConvBlock3d(f, f * 2)
+        self.down2 = ConvBlock(f, f * 2)
         self.pool2 = nn.Conv3d(f * 2, f * 2, 3, stride=2, padding=1)
 
         self.bottleneck = nn.Sequential(
-            ConvBlock3d(f * 2, f * 4),
-            SpatialTransformerBlock3d(f * 4, n_heads=2)
+            ConvBlock(f * 2, f * 4),
+            SpatialTransformer(f * 4, n_heads=2)
         )
 
         self.up1 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv3d(f * 4, f * 4, 3, padding=1))
-        self.conv_up1 = ConvBlock3d(f * 6, f * 2)
+        self.conv_up1 = ConvBlock(f * 6, f * 2)
 
         self.up2 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv3d(f * 2, f * 2, 3, padding=1))
-        self.conv_up2 = ConvBlock3d(f * 3, f)
+        self.conv_up2 = ConvBlock(f * 3, f)
 
         self.out_conv = nn.Conv3d(f, out_channels, 1)
         self.ds_conv = nn.Conv3d(f * 2, out_channels, 1)
@@ -234,7 +234,7 @@ class UNet3D(nn.Module):
 # SECTION 3: 3D PEAK FINDING (MEAN-SHIFT)
 # ==============================================================================
 
-class BatchedMeanShiftPeakFinder3D(nn.Module):
+class PeakFinder(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, _, X, _, _ = density.shape
 
@@ -293,7 +293,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
 # SECTION 4: THE PAIRFORMER ARCHITECTURE
 # ==============================================================================
 
-class RelativePositionEmbedding(nn.Module):
+class RelPosEmbedding(nn.Module):
     def __init__(self, max_rel_pos: int = 32, c_z: int = 32):
         super().__init__()
         self.max_rel_pos = max_rel_pos
@@ -306,12 +306,12 @@ class RelativePositionEmbedding(nn.Module):
         return self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)  # [seq_len, seq_len, c_z]
 
 
-class SequenceToPairInitializer(nn.Module):
+class SeqToPair(nn.Module):
     def __init__(self, c_s: int, c_z: int, max_rel_pos: int = 32):
         super().__init__()
         self.linear_s_q = nn.Linear(c_s, c_z)
         self.linear_s_k = nn.Linear(c_s, c_z)
-        self.rel_pos = RelativePositionEmbedding(max_rel_pos, c_z)
+        self.rel_pos = RelPosEmbedding(max_rel_pos, c_z)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         # s shape: [B, seq_len, c_s]
@@ -320,7 +320,7 @@ class SequenceToPairInitializer(nn.Module):
         return s_q + s_k + self.rel_pos(s.shape[1]).unsqueeze(0)  # [B, seq_len, seq_len, c_z]
 
 
-class AttentionPairBias(nn.Module):
+class PairAttention(nn.Module):
     def __init__(self, c_s: int, c_z: int, n_heads: int = 4):
         super().__init__()
         self.n_heads = n_heads
@@ -358,7 +358,7 @@ class AttentionPairBias(nn.Module):
         return self.proj_out(out)  # [B, N, c_s]
 
 
-class OuterProductMean(nn.Module):
+class OuterProduct(nn.Module):
     def __init__(self, c_s: int, c_z: int, c_hidden: int = 16):
         super().__init__()
         self.ln = nn.LayerNorm(c_s)
@@ -380,7 +380,7 @@ class OuterProductMean(nn.Module):
         return out  # [B, N, N, c_z]
 
 
-class TriangleMultiplicativeUpdate(nn.Module):
+class TriangleUpdate(nn.Module):
     def __init__(self, c_z: int, c_hidden: int = 32):
         super().__init__()
         self.ln = nn.LayerNorm(c_z)
@@ -408,13 +408,13 @@ class TriangleMultiplicativeUpdate(nn.Module):
 class PairformerBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, n_heads: int = 4):
         super().__init__()
-        self.attn = AttentionPairBias(c_s, c_z, n_heads)
+        self.attn = PairAttention(c_s, c_z, n_heads)
         self.ln_s1 = nn.LayerNorm(c_s)
         self.transition_s = nn.Sequential(
             nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
         )
-        self.opm = OuterProductMean(c_s, c_z)
-        self.tri_mul = TriangleMultiplicativeUpdate(c_z)
+        self.opm = OuterProduct(c_s, c_z)
+        self.tri_mul = TriangleUpdate(c_z)
         self.transition_z = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
         )
@@ -432,7 +432,7 @@ class PairformerBlock(nn.Module):
         return s, z  # ([B, N, c_s], [B, N, N, c_z])
 
 
-class PairformerStack(nn.Module):
+class Pairformer(nn.Module):
     def __init__(self, c_s: int, c_z: int, n_blocks: int = 3, n_heads: int = 4):
         super().__init__()
         self.blocks = nn.ModuleList([PairformerBlock(c_s, c_z, n_heads) for _ in range(n_blocks)])
@@ -443,12 +443,12 @@ class PairformerStack(nn.Module):
         return s, z
 
 
-class PairformerContactPredictor(nn.Module):
+class ContactPredictor(nn.Module):
     def __init__(self, vocab_size: int, c_s: int = 64, c_z: int = 32, n_blocks: int = 3, n_heads: int = 4, max_rel_pos: int = 32):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
-        self.initializer = SequenceToPairInitializer(c_s, c_z, max_rel_pos)
-        self.pairformer = PairformerStack(c_s, c_z, n_blocks, n_heads)
+        self.initializer = SeqToPair(c_s, c_z, max_rel_pos)
+        self.pairformer = Pairformer(c_s, c_z, n_blocks, n_heads)
         self.contact_head = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 16), nn.ReLU(), nn.Linear(16, 1)
         )
@@ -477,7 +477,7 @@ def print_ascii_contact_map(gt: torch.Tensor, pred: torch.Tensor, threshold: flo
 # SECTION 4B: THE EM-PAIRFORMER ARCHITECTURE
 # ==============================================================================
 
-class InterMultiplicativeUpdate(nn.Module):
+class InterUpdate(nn.Module):
     def __init__(self, c_z: int, c_p: int, c_hidden: int, c_pz: int, outgoing: bool = True):
         super().__init__()
         self.outgoing = outgoing
@@ -512,7 +512,7 @@ class InterMultiplicativeUpdate(nn.Module):
         return self.lin_out(self.ln_out(out))  # [B, N_point, N_res, c_pz]
 
 
-class JointAttentionWithPairBias(nn.Module):
+class JointAttention(nn.Module):
     def __init__(self, c_pz: int, c_bias: int, c_hidden: int, n_heads: int = 4, along_dim: int = -2):
         super().__init__()
         self.n_heads = n_heads
@@ -547,7 +547,7 @@ class JointAttentionWithPairBias(nn.Module):
         return self.proj_out(out)  # [B, N_point, N_res, c_pz]
 
 
-class PointResidueTransition(nn.Module):
+class PRTransition(nn.Module):
     def __init__(self, c_pz: int, n: int = 4):
         super().__init__()
         self.net = nn.Sequential(
@@ -561,7 +561,7 @@ class PointResidueTransition(nn.Module):
         return self.net(pz)
 
 
-class EMOuterProductMean(nn.Module):
+class EMOuterProduct(nn.Module):
     def __init__(self, c_m: int, c_z: int, c_hidden: int = 16):
         super().__init__()
         self.ln = nn.LayerNorm(c_m)
@@ -579,28 +579,28 @@ class EMOuterProductMean(nn.Module):
         return out  # [B, N, N, c_z]
 
 
-class EMPairformerBlock(nn.Module):
+class EMBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, c_pz: int, c_p: int, n_heads: int = 4):
         super().__init__()
-        self.tri_mul_out = TriangleMultiplicativeUpdate(c_z)
-        self.tri_mul_in = TriangleMultiplicativeUpdate(c_z)
+        self.tri_mul_out = TriangleUpdate(c_z)
+        self.tri_mul_in = TriangleUpdate(c_z)
 
-        self.inter_outgoing = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
-        self.inter_incoming = InterMultiplicativeUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
+        self.inter_outgoing = InterUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
+        self.inter_incoming = InterUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
 
-        self.residue_row_attn = JointAttentionWithPairBias(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads, along_dim=-2)
-        self.point_column_attn = JointAttentionWithPairBias(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads, along_dim=-3)
-        self.pz_transition = PointResidueTransition(c_pz)
+        self.residue_row_attn = JointAttention(c_pz, c_z, c_hidden=c_pz, n_heads=n_heads, along_dim=-2)
+        self.point_column_attn = JointAttention(c_pz, c_p, c_hidden=c_pz, n_heads=n_heads, along_dim=-3)
+        self.pz_transition = PRTransition(c_pz)
 
-        self.outer_row_opm = EMOuterProductMean(c_pz, c_z, c_hidden=16)
-        self.outer_col_opm = EMOuterProductMean(c_pz, c_p, c_hidden=16)
+        self.outer_row_opm = EMOuterProduct(c_pz, c_z, c_hidden=16)
+        self.outer_col_opm = EMOuterProduct(c_pz, c_p, c_hidden=16)
 
         self.transition_z = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 4 * c_z), nn.GELU(), nn.Linear(4 * c_z, c_z)
         )
         self.c_s = c_s
         if c_s > 0:
-            self.attn = AttentionPairBias(c_s, c_z, n_heads)
+            self.attn = PairAttention(c_s, c_z, n_heads)
             self.transition_s = nn.Sequential(
                 nn.LayerNorm(c_s), nn.Linear(c_s, 4 * c_s), nn.GELU(), nn.Linear(4 * c_s, c_s)
             )
@@ -635,10 +635,10 @@ class EMPairformerBlock(nn.Module):
         return s, z, pz, p  # shapes: ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
 
 
-class EMPairformerStack(nn.Module):
+class EMPairformer(nn.Module):
     def __init__(self, c_s: int, c_z: int, c_pz: int, c_p: int, n_blocks: int = 3, n_heads: int = 4):
         super().__init__()
-        self.blocks = nn.ModuleList([EMPairformerBlock(c_s, c_z, c_pz, c_p, n_heads) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([EMBlock(c_s, c_z, c_pz, c_p, n_heads) for _ in range(n_blocks)])
 
     def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch_first: bool = False) -> tuple:
         for i, block in enumerate(self.blocks):
@@ -731,8 +731,8 @@ if __name__ == "__main__":
         v_test = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in test_pids]
 
         # Initialize models
-        unet_atom = torch.compile(UNet3D(1, 1, init_features=16))
-        unet_res = torch.compile(UNet3D(1, len(RESIDUE_MAP) + 1, init_features=16))
+        unet_atom = torch.compile(UNet(1, 1, init_features=16))
+        unet_res = torch.compile(UNet(1, len(RESIDUE_MAP) + 1, init_features=16))
         opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001)
         criterion_atom = BCEDiceLoss()
         criterion_res = nn.CrossEntropyLoss(ignore_index=0)
@@ -813,7 +813,7 @@ if __name__ == "__main__":
         # Test Evaluation for this fold
         print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
         unet_atom.eval(); unet_res.eval()
-        peak_finder = BatchedMeanShiftPeakFinder3D()
+        peak_finder = PeakFinder()
 
         fold_pdb_results = []
         num_test_crops = 1 if device.type == "cpu" else 10  # 10 random crops per unseen test target
@@ -912,7 +912,7 @@ if __name__ == "__main__":
     print(" PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION ")
     print("="*70)
 
-    pairformer = torch.compile(PairformerContactPredictor(
+    pairformer = torch.compile(ContactPredictor(
         vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
     ))
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
@@ -996,14 +996,14 @@ if __name__ == "__main__":
 
         # Embed sequence and initialize residue pairs
         embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
-        initializer = SequenceToPairInitializer(c_s, c_z, MAX_REL_POS)
+        initializer = SeqToPair(c_s, c_z, MAX_REL_POS)
 
         s = embedding(mock_tokens)  # [B, N_res, c_s]
         z = initializer(s)  # [B, N_res, N_res, c_z]
 
         # 3. Instantiate EMPairformerStack
         print("  Instantiating EMPairformerStack...")
-        em_pairformer = torch.compile(EMPairformerStack(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4))
+        em_pairformer = torch.compile(EMPairformer(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4))
         em_pairformer.eval()
 
         # 4. Forward pass under dynamic Shape Watcher

@@ -235,7 +235,7 @@ class UNet3D(nn.Module):
 # ==============================================================================
 
 class BatchedMeanShiftPeakFinder3D(nn.Module):
-    def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, _, X, _, _ = density.shape
 
         # 1. Find local maximum seeds
@@ -284,15 +284,7 @@ class BatchedMeanShiftPeakFinder3D(nn.Module):
         out_mask = torch.zeros(B, MAX_PEAKS, dtype=torch.bool)
         out_mask[b_idx_o, out_seq_idx] = True
 
-        spacing = BOX_SIZE / (X - 1)
-        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)
-
-        # Flatten coords to lookup original densities
-        flat_coords = coords_grid[..., 0] * (X * X) + coords_grid[..., 1] * X + coords_grid[..., 2]
-        lookup_vals = torch.gather(density.view(B, -1), dim=-1, index=flat_coords)
-        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
-
-        return out_coords, out_vals, out_mask
+        return out_coords, out_mask
 
 # ==============================================================================
 # SECTION 4: THE PAIRFORMER ARCHITECTURE
@@ -836,7 +828,7 @@ if __name__ == "__main__":
                     test_in_batch = test_input.unsqueeze(0).unsqueeze(0)  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
                     pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                    pred_coords, _, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_mask: [1, M] (bool)
+                    pred_coords, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_mask: [1, M] (bool)
                     pred_res_logits = unet_res(test_in_batch)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
                     pred_coords_gpu = pred_coords[0]  # [M, 3]

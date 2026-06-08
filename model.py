@@ -236,58 +236,59 @@ class UNet(nn.Module):
 
 class PeakFinder(nn.Module):
     def forward(self, density: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, _, X, _, _ = density.shape
+        # density shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        B, _, X, _, _ = density.shape  # dimensions extracted
 
         # 1. Find local maximum seeds
-        density_seeds_only = torch.where(F.max_pool3d(density, kernel_size=3, padding=1, stride=1) == density, density, -1e9) # Is it a peak?
-        top_vals, top_idx = torch.topk(density_seeds_only.view(B, -1), k=MAX_PEAKS, dim=-1) # Find top k peaks
-        seeds_mask = top_vals > PEAK_THRESHOLD # Make sure it meets the threshold
+        density_seeds_only = torch.where(F.max_pool3d(density, kernel_size=3, padding=1, stride=1) == density, density, -1e9) # [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        top_vals, top_idx = torch.topk(density_seeds_only.view(B, -1), k=MAX_PEAKS, dim=-1) # both [B, MAX_PEAKS]
+        seeds_mask = top_vals > PEAK_THRESHOLD # [B, MAX_PEAKS] (bool)
 
         # Create the 3D coordinate grid and map top indices to 3D grid coordinates
-        ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)
-        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)
-        seeds = grid[top_idx]
-        seeds.masked_fill_(~seeds_mask.unsqueeze(-1), 0.0)
+        ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)  # [GRID_SIZE]
+        grid = torch.stack(torch.meshgrid(ticks, ticks, ticks, indexing='ij'), dim=-1).view(-1, 3)  # [GRID_SIZE^3, 3]
+        seeds = grid[top_idx]  # [B, MAX_PEAKS, 3]
+        seeds.masked_fill_(~seeds_mask.unsqueeze(-1), 0.0)  # [B, MAX_PEAKS, 3]
 
-        bandwidth_gaussian = 1.0 / (2 * PEAK_BANDWIDTH ** 2)
-        weights_grid = torch.where(density.view(B, -1) > PEAK_THRESHOLD, density.view(B, -1), 0.0)
+        bandwidth_gaussian = 1.0 / (2 * PEAK_BANDWIDTH ** 2)  # scaler
+        weights_grid = torch.where(density.view(B, -1) > PEAK_THRESHOLD, density.view(B, -1), 0.0)  # [B, GRID_SIZE^3]
 
         # 2. Mean peak shift
         for _ in range(PEAK_ITERATIONS):
-            sq_dists = torch.cdist(seeds, grid.unsqueeze(0), p=2) ** 2
-            weights = torch.exp(-sq_dists * bandwidth_gaussian) * weights_grid.unsqueeze(1)
-            seeds = weights @ grid / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+            sq_dists = torch.cdist(seeds, grid.unsqueeze(0), p=2) ** 2  # [B, MAX_PEAKS, GRID_SIZE^3]
+            weights = torch.exp(-sq_dists * bandwidth_gaussian) * weights_grid.unsqueeze(1)  # [B, MAX_PEAKS, GRID_SIZE^3]
+            seeds = weights @ grid / (weights.sum(dim=-1, keepdim=True) + 1e-8)  # [B, MAX_PEAKS, 3]
 
         # Purge duplicate peaks that converged to the same location
-        seed_dists = torch.cdist(seeds, seeds, p=2) ** 2
-        clash_matrix = torch.triu(seed_dists < (CLASH_LIMIT ** 2), diagonal=1)
+        seed_dists = torch.cdist(seeds, seeds, p=2) ** 2  # [B, MAX_PEAKS, MAX_PEAKS]
+        clash_matrix = torch.triu(seed_dists < (CLASH_LIMIT ** 2), diagonal=1)  # [B, MAX_PEAKS, MAX_PEAKS] (bool)
 
-        keep = seeds_mask.clone()
+        keep = seeds_mask.clone()  # [B, MAX_PEAKS] (bool)
         for i in range(MAX_PEAKS - 1):
-            keep = keep & ~(clash_matrix[:, i, :] & keep[:, i:i+1])
+            keep = keep & ~(clash_matrix[:, i, :] & keep[:, i:i+1])  # [B, MAX_PEAKS] (bool)
 
         # Push kept peaks contiguously to the front of the array (Vectorized Packing)
-        keep_cum = torch.cumsum(keep.long(), dim=-1)
-        target_peaks_idx = keep_cum - 1
+        keep_cum = torch.cumsum(keep.long(), dim=-1)  # [B, MAX_PEAKS] (long)
+        target_peaks_idx = keep_cum - 1  # [B, MAX_PEAKS] (long)
 
-        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)
-        out_seq_idx = target_peaks_idx[b_idx_o, seq_idx_o]
+        b_idx_o, seq_idx_o = torch.nonzero(keep, as_tuple=True)  # indices of shape [N_nonzero]
+        out_seq_idx = target_peaks_idx[b_idx_o, seq_idx_o]  # [N_nonzero]
 
-        out_coords = torch.zeros(B, MAX_PEAKS, 3)
-        out_coords[b_idx_o, out_seq_idx] = seeds[b_idx_o, seq_idx_o]
+        out_coords = torch.zeros(B, MAX_PEAKS, 3)  # [B, MAX_PEAKS, 3]
+        out_coords[b_idx_o, out_seq_idx] = seeds[b_idx_o, seq_idx_o]  # [B, MAX_PEAKS, 3]
 
-        out_mask = torch.zeros(B, MAX_PEAKS, dtype=torch.bool)
-        out_mask[b_idx_o, out_seq_idx] = True
+        out_mask = torch.zeros(B, MAX_PEAKS, dtype=torch.bool)  # [B, MAX_PEAKS] (bool)
+        out_mask[b_idx_o, out_seq_idx] = True  # [B, MAX_PEAKS] (bool)
 
-        spacing = BOX_SIZE / (X - 1)
-        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)
+        spacing = BOX_SIZE / (X - 1)  # scaler
+        coords_grid = (out_coords / spacing).round().long().clamp(0, X - 1)  # [B, MAX_PEAKS, 3] (long)
 
         # Flatten coords to lookup original densities
-        flat_coords = coords_grid[..., 0] * (X * X) + coords_grid[..., 1] * X + coords_grid[..., 2]
-        lookup_vals = torch.gather(density.view(B, -1), dim=-1, index=flat_coords)
-        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)
+        flat_coords = coords_grid[..., 0] * (X * X) + coords_grid[..., 1] * X + coords_grid[..., 2]  # [B, MAX_PEAKS] (long)
+        lookup_vals = torch.gather(density.view(B, -1), dim=-1, index=flat_coords)  # [B, MAX_PEAKS]
+        out_vals = lookup_vals.masked_fill(~out_mask, 0.0)  # [B, MAX_PEAKS]
 
-        return out_coords, out_vals, out_mask
+        return out_coords, out_vals, out_mask  # ([B, MAX_PEAKS, 3], [B, MAX_PEAKS], [B, MAX_PEAKS])
 
 # ==============================================================================
 # SECTION 4: THE PAIRFORMER ARCHITECTURE
@@ -305,9 +306,9 @@ class SeqToPair(nn.Module):
         # s shape: [B, seq_len, c_s]
         s_q = self.linear_s_q(s).unsqueeze(2)  # [B, seq_len, 1, c_z]
         s_k = self.linear_s_k(s).unsqueeze(1)  # [B, 1, seq_len, c_z]
-        pos = torch.arange(s.shape[1])
-        diff = pos.unsqueeze(1) - pos.unsqueeze(0)
-        rel_pos = self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)
+        pos = torch.arange(s.shape[1])  # [seq_len]
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # [seq_len, seq_len]
+        rel_pos = self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)  # [seq_len, seq_len, c_z]
         return s_q + s_k + rel_pos.unsqueeze(0)  # [B, seq_len, seq_len, c_z]
 
 
@@ -327,22 +328,24 @@ class BiasedAttention(nn.Module):
         self.proj_out = nn.Linear(c_hidden, c_in)
 
     def forward(self, x: torch.Tensor, bias: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        x_norm = self.ln_x(x)
-        is_3d = x.dim() == 3
-        x_4d = x_norm.unsqueeze(1) if is_3d else (x_norm.transpose(1, 2) if self.along_dim == -3 else x_norm)
-        B, O, A, _ = x_4d.shape
-        q, k, v, g = [proj(x_4d).view(B, O, A, self.n_heads, self.d_k).transpose(2, 3) 
-                      for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)
-        bias_proj = self.proj_bias(self.ln_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)
-        attn = F.softmax(logits + bias_proj, dim=-1)
-        out = (attn @ v * torch.sigmoid(g)).transpose(2, 3).reshape(B, O, A, -1)
-        out = self.proj_out(out)
+        # x shape: [B, A, c_in] (3D) or [B, O, A, c_in] (4D)
+        # bias shape: [B, A, A, c_bias] (3D) or [B, O, O, c_bias] (4D) or [B, A, A, c_bias]
+        x_norm = self.ln_x(x)  # [B, A, c_in] or [B, O, A, c_in]
+        is_3d = x.dim() == 3  # bool
+        x_4d = x_norm.unsqueeze(1) if is_3d else (x_norm.transpose(1, 2) if self.along_dim == -3 else x_norm)  # [B, O, A, c_in]
+        B, O, A, _ = x_4d.shape  # shapes extracted
+        q, k, v, g = [proj(x_4d).view(B, O, A, self.n_heads, self.d_k).transpose(2, 3)
+                      for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]  # each [B, O, n_heads, A, d_k]
+        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, O, n_heads, A, A]
+        bias_proj = self.proj_bias(self.ln_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, n_heads, A, A]
+        attn = F.softmax(logits + bias_proj, dim=-1)  # [B, O, n_heads, A, A]
+        out = (attn @ v * torch.sigmoid(g)).transpose(2, 3).reshape(B, O, A, -1)  # [B, O, A, c_hidden]
+        out = self.proj_out(out)  # [B, O, A, c_in]
         if is_3d:
-            out = out.squeeze(1)
+            out = out.squeeze(1)  # [B, A, c_in]
         else:
             if self.along_dim == -3:
-                out = out.transpose(1, 2)
+                out = out.transpose(1, 2)  # [B, O, A, c_in] (transposed back)
         if shape_watch:
             print(f"    [Shape Watcher - BiasedAttention]\n      x={list(x.shape)}, bias={list(bias.shape)}, out={list(out.shape)}")
         return out
@@ -357,15 +360,16 @@ class OuterProduct(nn.Module):
         self.lin_out = nn.Linear(c_hidden ** 2, c_out)
 
     def forward(self, x: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        x_norm = self.ln(x)
-        a, b = self.lin1(x_norm), self.lin2(x_norm)
-        outer = torch.einsum("b ... i c, b ... j d -> b i j c d", a, b).flatten(start_dim=-2)
-        out = self.lin_out(outer)
+        # x shape: [B, N, c_in] (3D) or [B, M, N, c_in] (4D)
+        x_norm = self.ln(x)  # [B, N, c_in] or [B, M, N, c_in]
+        a, b = self.lin1(x_norm), self.lin2(x_norm)  # both [B, N, c_hidden] or [B, M, N, c_hidden]
+        outer = torch.einsum("b ... i c, b ... j d -> b i j c d", a, b).flatten(start_dim=-2)  # [B, N, N, c_hidden^2]
+        out = self.lin_out(outer)  # [B, N, N, c_out]
         if x.dim() == 4:
-            out = out / (x.shape[1] + 1e-8)
+            out = out / (x.shape[1] + 1e-8)  # [B, N, N, c_out]
         if shape_watch:
             print(f"    [Shape Watcher - OuterProduct]\n      outer_flat={list(outer.shape)}, update={list(out.shape)}")
-        return out
+        return out  # [B, N, N, c_out]
 
 
 class TransitionBlock(nn.Module):
@@ -380,7 +384,8 @@ class TransitionBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # x shape: [B, ...]
+        return self.net(x)  # [B, ...]
 
 
 
@@ -438,9 +443,10 @@ class Pairformer(nn.Module):
         self.blocks = nn.ModuleList([PairformerBlock(c_s, c_z, n_heads) for _ in range(n_blocks)])
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch_first: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        # s shape: [B, N, c_s], z shape: [B, N, N, c_z]
         for i, block in enumerate(self.blocks):
-            s, z = block(s, z, shape_watch=(shape_watch_first and i == 0))
-        return s, z
+            s, z = block(s, z, shape_watch=(shape_watch_first and i == 0))  # shapes unchanged
+        return s, z  # ([B, N, c_s], [B, N, N, c_z])
 
 
 class ContactPredictor(nn.Module):
@@ -454,7 +460,7 @@ class ContactPredictor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
-        # x shape: [B, N] (long) (residue sequence tokens)
+        # x shape: [B, N] (long)
         s = self.embedding(x)  # [B, N, c_s]
         z = self.initializer(s)  # [B, N, N, c_z]
         s, z = self.pairformer(s, z, shape_watch_first=shape_watch)  # ([B, N, c_s], [B, N, N, c_z])
@@ -492,7 +498,8 @@ class InterUpdate(nn.Module):
         self.lin_out = nn.Linear(c_hidden, c_pz)
 
     def forward(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        # z: [B, N_res, N_res, c_z], p: [B, N_point, N_point, c_p]
+        # z shape: [B, N_res, N_res, c_z]
+        # p shape: [B, N_point, N_point, c_p]
         p_norm = self.ln_p(p)  # [B, N_point, N_point, c_p]
         z_norm = self.ln_z(z)  # [B, N_res, N_res, c_z]
 
@@ -570,9 +577,10 @@ class EMPairformer(nn.Module):
         self.blocks = nn.ModuleList([EMBlock(c_s, c_z, c_pz, c_p, n_heads) for _ in range(n_blocks)])
 
     def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch_first: bool = False) -> tuple:
+        # s shape: [B, N_res, c_s] or None, z shape: [B, N_res, N_res, c_z], pz shape: [B, N_point, N_res, c_pz], p shape: [B, N_point, N_point, c_p]
         for i, block in enumerate(self.blocks):
-            s, z, pz, p = block(s, z, pz, p, shape_watch=(shape_watch_first and i == 0))
-        return s, z, pz, p
+            s, z, pz, p = block(s, z, pz, p, shape_watch=(shape_watch_first and i == 0))  # shapes unchanged
+        return s, z, pz, p  # ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
 
 
 # ==============================================================================

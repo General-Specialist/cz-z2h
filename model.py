@@ -295,12 +295,12 @@ class PeakFinder(nn.Module):
 # ==============================================================================
 
 class SeqToPair(nn.Module):
-    def __init__(self, c_s: int, c_z: int, max_rel_pos: int = 32):
+    def __init__(self, c_s: int, c_z: int):
         super().__init__()
         self.linear_s_q = nn.Linear(c_s, c_z)
         self.linear_s_k = nn.Linear(c_s, c_z)
-        self.max_rel_pos = max_rel_pos
-        self.emb = nn.Embedding(2 * max_rel_pos + 1, c_z)
+        self.max_rel_pos = MAX_REL_POS
+        self.emb = nn.Embedding(2 * MAX_REL_POS + 1, c_z)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         # s shape: [B, seq_len, c_s]
@@ -453,7 +453,7 @@ class ContactPredictor(nn.Module):
     def __init__(self, vocab_size: int, c_s: int = 64, c_z: int = 32, n_blocks: int = 3, n_heads: int = 4, max_rel_pos: int = 32):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
-        self.initializer = SeqToPair(c_s, c_z, max_rel_pos)
+        self.initializer = SeqToPair(c_s, c_z)
         self.pairformer = Pairformer(c_s, c_z, n_blocks, n_heads)
         self.contact_head = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 16), nn.ReLU(), nn.Linear(16, 1)
@@ -931,7 +931,7 @@ if __name__ == "__main__":
 
         # Embed sequence and initialize residue pairs
         embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
-        initializer = SeqToPair(c_s, c_z, MAX_REL_POS)
+        initializer = SeqToPair(c_s, c_z)
 
         s = embedding(mock_tokens)  # [B, N_res, c_s]
         z = initializer(s)  # [B, N_res, N_res, c_z]

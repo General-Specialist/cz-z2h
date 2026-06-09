@@ -318,8 +318,8 @@ class BiasedAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = c_hidden // n_heads
         self.along_dim = along_dim
-        self.ln_x = nn.LayerNorm(c_in) if has_norms else nn.Identity()
-        self.ln_bias = nn.LayerNorm(c_bias) if has_norms else nn.Identity()
+        self.norm_x = nn.LayerNorm(c_in) if has_norms else nn.Identity()
+        self.norm_bias = nn.LayerNorm(c_bias) if has_norms else nn.Identity()
         self.proj_q = nn.Linear(c_in, c_hidden, bias=False)
         self.proj_k = nn.Linear(c_in, c_hidden, bias=False)
         self.proj_v = nn.Linear(c_in, c_hidden, bias=False)
@@ -330,14 +330,20 @@ class BiasedAttention(nn.Module):
     def forward(self, x: torch.Tensor, bias: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
         # x shape: [B, A, c_in] (3D) or [B, O, A, c_in] (4D)
         # bias shape: [B, A, A, c_bias] (3D) or [B, O, O, c_bias] (4D) or [B, A, A, c_bias]
-        x_norm = self.ln_x(x)  # [B, A, c_in] or [B, O, A, c_in]
-        is_3d = x.dim() == 3  # bool
-        x_4d = x_norm.unsqueeze(1) if is_3d else (x_norm.transpose(1, 2) if self.along_dim == -3 else x_norm)  # [B, O, A, c_in]
-        B, O, A, _ = x_4d.shape  # shapes extracted
-        q, k, v, g = [proj(x_4d).view(B, O, A, self.n_heads, self.d_k).transpose(2, 3)
-                      for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]  # each [B, O, n_heads, A, d_k]
+        is_3d = x.dim() == 3  # bool  # [B, A, c_in] or [B, O, A, c_in]
+        if is_3d:
+            x = x.unsqueeze(1)
+        elif self.along_dim == -3:
+            x = x.transpose(1, 2)
+        else:
+            x = x
+        # x shape: [B, O, A, c_in]
+        B, O, A, _ = x.shape  # shapes extracted
+        x = self.norm_x(x)
+        q, k, v, g = [rearrange(proj(x), 'b o (a h d) -> b o h a d', h=self.n_heads, d=self.d_k)
+                    for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]  # each [B, O, n_heads, A, d_k]
         logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, O, n_heads, A, A]
-        bias_proj = self.proj_bias(self.ln_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, n_heads, A, A]
+        bias_proj = self.proj_bias(self.norm_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, n_heads, A, A]
         attn = F.softmax(logits + bias_proj, dim=-1)  # [B, O, n_heads, A, A]
         out = (attn @ v * torch.sigmoid(g)).transpose(2, 3).reshape(B, O, A, -1)  # [B, O, A, c_hidden]
         out = self.proj_out(out)  # [B, O, A, c_in]

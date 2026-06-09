@@ -340,9 +340,9 @@ class BiasedAttention(nn.Module):
         # x shape: [B, O, A, c_in]
         B, O, A, _ = x.shape  # shapes extracted
         x = self.norm_x(x)
-        q, k, v, g = [rearrange(proj(x), 'b o (a h d) -> b o h a d', h=self.n_heads, d=self.d_k)
+        q, k, v, g = [rearrange(proj(x), 'b o a (h d) -> b o h a d', h=self.n_heads, d=self.d_k)
                     for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]  # each [B, O, n_heads, A, d_k]
-        logits = torch.matmul(q, k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, O, n_heads, A, A]
+        logits = (q @ k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, O, n_heads, A, A]
         bias_proj = self.proj_bias(self.norm_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, n_heads, A, A]
         attn = F.softmax(logits + bias_proj, dim=-1)  # [B, O, n_heads, A, A]
         out = (attn @ v * torch.sigmoid(g)).transpose(2, 3).reshape(B, O, A, -1)  # [B, O, A, c_hidden]

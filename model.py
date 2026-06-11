@@ -352,8 +352,7 @@ class BiasedAttention(nn.Module):
         else:
             if self.along_dim == -3:
                 out = out.transpose(1, 2)  # [B, O, A, c_in] (transposed back)
-        if shape_watch:
-            print(f"    [Shape Watcher - BiasedAttention]\n      x={list(x.shape)}, bias={list(bias.shape)}, out={list(out.shape)}")
+        if shape_watch: print(f"    [Shape Watcher - BiasedAttention]\n      x={list(x.shape)}, bias={list(bias.shape)}, out={list(out.shape)}")
         return out
 
 
@@ -367,14 +366,13 @@ class OuterProduct(nn.Module):
 
     def forward(self, x: torch.Tensor, shape_watch: bool = False) -> torch.Tensor:
         # x shape: [B, N, c_in] (3D) or [B, M, N, c_in] (4D)
-        x_norm = self.ln(x)  # [B, N, c_in] or [B, M, N, c_in]
-        a, b = self.lin1(x_norm), self.lin2(x_norm)  # both [B, N, c_hidden] or [B, M, N, c_hidden]
+        x = self.ln(x)  # [B, N, c_in] or [B, M, N, c_in]
+        a, b = self.lin1(x), self.lin2(x)  # both [B, N, c_hidden] or [B, M, N, c_hidden]
         outer = torch.einsum("b ... i c, b ... j d -> b i j c d", a, b).flatten(start_dim=-2)  # [B, N, N, c_hidden^2]
         out = self.lin_out(outer)  # [B, N, N, c_out]
         if x.dim() == 4:
             out = out / (x.shape[1] + 1e-8)  # [B, N, N, c_out]
-        if shape_watch:
-            print(f"    [Shape Watcher - OuterProduct]\n      outer_flat={list(outer.shape)}, update={list(out.shape)}")
+        if shape_watch: print(f"    [Shape Watcher - OuterProduct]\n      outer_flat={list(outer.shape)}, update={list(out.shape)}")
         return out  # [B, N, N, c_out]
 
 
@@ -392,7 +390,6 @@ class TransitionBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [B, ...]
         return self.net(x)  # [B, ...]
-
 
 
 class TriangleUpdate(nn.Module):
@@ -414,8 +411,7 @@ class TriangleUpdate(nn.Module):
         out = torch.einsum("b i k c, b j k c -> b i j c", a, b)  # [B, N, N, c_hidden]
         final_out = self.lin_out(out) * torch.sigmoid(self.lin_gate_out(z_norm))  # [B, N, N, c_z]
 
-        if shape_watch:
-            print(f"    [Shape Watcher - TriangleMultiplicativeUpdate]\n      gathered_sum={list(out.shape)}")
+        if shape_watch: print(f"    [Shape Watcher - TriangleMultiplicativeUpdate]\n      gathered_sum={list(out.shape)}")
 
         return final_out  # [B, N, N, c_z]
 

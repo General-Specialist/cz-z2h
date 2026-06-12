@@ -8,7 +8,6 @@ import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 from tqdm import tqdm
 from sklearn.model_selection import KFold
-from scipy.optimize import linear_sum_assignment
 from einops import rearrange
 
 
@@ -37,7 +36,7 @@ RADIUS = 1.5
 # Mean-Shift Peak Finding Constants
 PEAK_THRESHOLD = 0.30
 PEAK_BANDWIDTH = 1.0
-MAX_PEAKS = 128
+MAX_PEAKS = 512
 PEAK_ITERATIONS = 5
 CLASH_LIMIT = 0.6
 
@@ -51,7 +50,7 @@ CONTACT_THRESHOLD = 8.0
 
 torch.set_default_device('cuda')
 device = torch.device("cuda")
-print(f"Using device: {device}")
+torch.set_float32_matmul_precision('high')
 
 # ==============================================================================
 # SECTION 1: RASTERIZATION & DATA PIPELINE
@@ -64,7 +63,7 @@ def download_pdb_cif(pdb_id: str) -> str:
     return str(path)
 
 
-def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: float = 0.8, radius: float = 0.8) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: float = 0.8, radius: float = 0.8, res_radius: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vectorized, chunk-free grid rasterization using torch.cdist.
     """
@@ -79,9 +78,7 @@ def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: 
     binary_grid = (dists <= radius).any(dim=-1).float().view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
     min_dists, min_idx = torch.min(dists, dim=-1)  # min_dists: [GRID_SIZE^3], min_idx: [GRID_SIZE^3] (long)
-    residue_grid = torch.zeros(grid.shape[0], dtype=torch.long)  # [GRID_SIZE^3] (long)
-    valid_mask = min_dists <= radius  # [GRID_SIZE^3] (bool)
-    residue_grid[valid_mask] = res_indices[min_idx[valid_mask]]  # [GRID_SIZE^3] (long)
+    residue_grid = torch.where(min_dists <= res_radius, res_indices[min_idx], 0)
 
     return density, binary_grid, residue_grid.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # returned as density/binary_grid: [GRID_SIZE, GRID_SIZE, GRID_SIZE], residue_grid: [GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
@@ -99,7 +96,7 @@ def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, retu
     sigma = random.uniform(0.8, 1.8) if is_training else 1.2
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
 
-    density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=RADIUS)
+    density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=RADIUS, res_radius=1.0)
 
     out_density = F.relu(density + torch.randn_like(density) * noise)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
     if return_coords:
@@ -146,13 +143,15 @@ def find_groups(c: int) -> int:
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_c: int, out_c: int):
+    def __init__(self, in_c: int, out_c: int, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
             nn.GroupNorm(find_groups(in_c), in_c), nn.SiLU(),
             nn.Conv3d(in_c, out_c, 3, padding=1),
+            nn.Dropout3d(dropout),
             nn.GroupNorm(find_groups(out_c), out_c), nn.SiLU(),
-            nn.Conv3d(out_c, out_c, 3, padding=1)
+            nn.Conv3d(out_c, out_c, 3, padding=1),
+            nn.Dropout3d(dropout)
         )
         self.skip = nn.Identity() if in_c == out_c else nn.Conv3d(in_c, out_c, 1)
 
@@ -162,14 +161,15 @@ class ConvBlock(nn.Module):
 
 
 class SpatialTransformer(nn.Module):
-    def __init__(self, channels: int, n_heads: int):
+    def __init__(self, channels: int, n_heads: int, dropout: float = 0.3):
         super().__init__()
         self.norm = nn.GroupNorm(find_groups(channels), channels)
         self.proj_in = nn.Conv3d(channels, channels, 1)
         self.proj_out = nn.Conv3d(channels, channels, 1)
-        self.attn = nn.MultiheadAttention(channels, n_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(channels, n_heads, batch_first=True, dropout=dropout)
         self.ff = nn.Sequential(
-            nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
+            nn.Linear(channels, channels * 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(channels * 4, channels), nn.Dropout(dropout)
         )
         self.norm_attn = nn.LayerNorm(channels)
         self.norm_ff = nn.LayerNorm(channels)
@@ -306,7 +306,7 @@ class SeqToPair(nn.Module):
         # s shape: [B, seq_len, c_s]
         s_q = self.linear_s_q(s).unsqueeze(2)  # [B, seq_len, 1, c_z]
         s_k = self.linear_s_k(s).unsqueeze(1)  # [B, 1, seq_len, c_z]
-        pos = torch.arange(s.shape[1])  # [seq_len]
+        pos = torch.arange(s.shape[1], device=s.device)  # [seq_len]
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # [seq_len, seq_len]
         rel_pos = self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)  # [seq_len, seq_len, c_z]
         return s_q + s_k + rel_pos.unsqueeze(0)  # [B, seq_len, seq_len, c_z]
@@ -340,7 +340,7 @@ class BiasedAttention(nn.Module):
         # x shape: [B, O, A, c_in]
         B, O, A, _ = x.shape  # shapes extracted
         x = self.norm_x(x)
-        q, k, v, g = [rearrange(proj(x), 'b o a (h d) -> b o h a d', h=self.n_heads, d=self.d_k)
+        q, k, v, g = [proj(x).view(B, O, A, self.n_heads, self.d_k).permute(0, 1, 3, 2, 4)
                     for proj in (self.proj_q, self.proj_k, self.proj_v, self.proj_gate)]  # each [B, O, n_heads, A, d_k]
         logits = (q @ k.transpose(-1, -2)) / (self.d_k ** 0.5)  # [B, O, n_heads, A, A]
         bias_proj = self.proj_bias(self.norm_bias(bias)).permute(0, 3, 1, 2).unsqueeze(1)  # [B, 1, n_heads, A, A]
@@ -637,7 +637,7 @@ if __name__ == "__main__":
     print("="*70)
 
     K_FOLDS = 5
-    NUM_EPOCHS = 1 if device.type == "cpu" else 100
+    NUM_EPOCHS = 1 if device.type == "cpu" else 250
     steps_per_epoch = 1 if device.type == "cpu" else 25
     MATCHING_RADIUS = 1.5
     spacing = BOX_SIZE / (GRID_SIZE - 1)
@@ -672,10 +672,13 @@ if __name__ == "__main__":
 
         # Initialize models
         unet_atom = torch.compile(UNet(1, 1, init_features=16))
-        unet_res = torch.compile(UNet(1, len(RESIDUE_MAP) + 1, init_features=16))
-        opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001)
+        # unet_res now takes 2 channels: density + detached atom prediction
+        unet_res = torch.compile(UNet(2, len(RESIDUE_MAP) + 1, init_features=32))
+        opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001, weight_decay=5e-3)
+        scheduler_unet = torch.optim.lr_scheduler.StepLR(opt_unet, step_size=60, gamma=0.5)
         criterion_atom = BCEDiceLoss()
-        criterion_res = nn.CrossEntropyLoss(ignore_index=0)
+        # Add label smoothing to regularize the residue classification
+        criterion_res = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
 
         def compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res):
             # pred_atom shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
@@ -699,7 +702,7 @@ if __name__ == "__main__":
         # Train loop
         for epoch in range(1, NUM_EPOCHS + 1):
             unet_atom.train(); unet_res.train()
-            epoch_loss = 0.0
+            epoch_loss = torch.tensor(0.0, device=device)
             for _ in range(steps_per_epoch):
                 samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
                 inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
@@ -710,19 +713,23 @@ if __name__ == "__main__":
 
                 opt_unet.zero_grad()
                 pred_atom, ds_atom = unet_atom(inputs, return_ds=True)  # pred_atom: [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_atom: [4, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
-                pred_res, ds_res = unet_res(inputs, return_ds=True)  # pred_res: [4, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_res: [4, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+
+                # Cascade: Concatenate raw density and detached atom predictions
+                res_inputs = torch.cat([inputs, torch.sigmoid(pred_atom).detach()], dim=1)
+                pred_res, ds_res = unet_res(res_inputs, return_ds=True)  # pred_res: [4, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_res: [4, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
 
                 loss = compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res)
                 loss.backward()
                 opt_unet.step()
-                epoch_loss += loss.item()
-            epoch_loss /= steps_per_epoch
+                epoch_loss += loss.detach()
+            epoch_loss_val = epoch_loss.item() / steps_per_epoch
+            scheduler_unet.step()
 
             # Periodic evaluation & clean printing
             if epoch % 50 == 0 or epoch == 1:
                 unet_atom.eval(); unet_res.eval()
                 with torch.no_grad():
-                    val_loss = 0.0
+                    val_loss = torch.tensor(0.0, device=device)
                     val_steps = 1 if device.type == "cpu" else 5
                     for _ in range(val_steps):
                         val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
@@ -731,11 +738,12 @@ if __name__ == "__main__":
                         val_target_res = torch.stack([s[2] for s in val_samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
                         val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)  # shapes same as above
-                        val_pred_res, val_ds_res = unet_res(val_inputs, return_ds=True)  # shapes same as above
-                        val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res).item()
-                    val_loss /= val_steps
+                        val_res_inputs = torch.cat([val_inputs, torch.sigmoid(val_pred_atom).detach()], dim=1)
+                        val_pred_res, val_ds_res = unet_res(val_res_inputs, return_ds=True)  # shapes same as above
+                        val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res)
+                    val_loss_val = val_loss.item() / val_steps
 
-                print(f"Fold {fold_idx + 1} | Epoch {epoch:03d}/100 | Train Loss: {epoch_loss:.4f} | Val Loss: {val_loss:.4f}")
+                print(f"Fold {fold_idx + 1} | Epoch {epoch:03d}/100 | Train Loss: {epoch_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -758,7 +766,10 @@ if __name__ == "__main__":
         for pid in test_pids:
             # Single PDB subset
             test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
-            pid_gt_atoms, pid_matched_atoms, pid_correct_residues, pid_resolved_peaks = 0, 0, 0, 0
+            pid_gt_atoms = torch.tensor(0, dtype=torch.long, device=device)
+            pid_matched_atoms = torch.tensor(0, dtype=torch.long, device=device)
+            pid_correct_residues = torch.tensor(0, dtype=torch.long, device=device)
+            pid_resolved_peaks = torch.tensor(0, dtype=torch.long, device=device)
 
             with torch.no_grad():
                 for _ in range(num_test_crops):
@@ -769,51 +780,86 @@ if __name__ == "__main__":
 
                     pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
                     pred_coords, pred_vals, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_vals: [1, M], pred_mask: [1, M] (bool)
-                    pred_res_logits = unet_res(test_in_batch)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    test_res_inputs = torch.cat([test_in_batch, pred_density.detach()], dim=1)
+                    pred_res_logits = unet_res(test_res_inputs)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
                     pred_coords_gpu = pred_coords[0]  # [M, 3]
-                    num_pred_peaks = pred_mask[0].sum().item()  # scaler
+                    valid_pred_coords = pred_coords_gpu[pred_mask[0]]  # [M_pred, 3]
 
-                    pid_resolved_peaks += num_pred_peaks
+                    pid_resolved_peaks += pred_mask[0].sum()
                     pid_gt_atoms += len(gt_coords)
 
-                    if num_pred_peaks > 0 and len(gt_coords) > 0:
-                        dists = torch.cdist(gt_coords, pred_coords_gpu[:num_pred_peaks])  # [N_cropped, num_pred_peaks]
-                        row_ind, col_ind = linear_sum_assignment(dists.cpu().numpy())
-                        for r, c in zip(row_ind, col_ind):
-                            dist = dists[r, c].item()
-                            if dist <= MATCHING_RADIUS:
-                                pid_matched_atoms += 1
-                                p_coord = pred_coords_gpu[c]  # [3]
-                                grid_idx = torch.clamp(torch.round(p_coord / spacing).long(), 0, GRID_SIZE - 1)  # [3] (long)
-                                logits = pred_res_logits[0, :, grid_idx[0], grid_idx[1], grid_idx[2]]  # [C_res]
-                                if torch.argmax(logits[1:]).item() + 1 == gt_res_indices[r].item():
-                                    pid_correct_residues += 1
+                    # Compute dists on GPU
+                    dists = torch.cdist(gt_coords, valid_pred_coords)  # [N_cropped, M_pred]
 
-            avg_peaks_per_crop = pid_resolved_peaks / num_test_crops
-            recovery_pct = (pid_matched_atoms / pid_gt_atoms) * 100 if pid_gt_atoms > 0 else 0.0
-            precision_pct = (pid_matched_atoms / pid_resolved_peaks) * 100 if pid_resolved_peaks > 0 else 0.0
+                    # Zero-sync Greedy Bipartite Matching on GPU
+                    dists_temp = dists.clone()
+                    N_gt, M_pred = dists_temp.shape
+                    K_matches = min(N_gt, M_pred)
+
+                    r_indices = torch.zeros(K_matches, dtype=torch.long, device=device)
+                    c_indices = torch.zeros(K_matches, dtype=torch.long, device=device)
+
+                    for i in range(K_matches):
+                        min_idx = torch.argmin(dists_temp)
+                        r = min_idx // M_pred
+                        c = min_idx % M_pred
+
+                        r_indices[i] = r
+                        c_indices[i] = c
+
+                        dists_temp[r, :] = float('inf')
+                        dists_temp[:, c] = float('inf')
+
+                    # Filter matches that are within the MATCHING_RADIUS
+                    matched_dists = dists[r_indices, c_indices]
+                    valid_mask = matched_dists <= MATCHING_RADIUS
+                    valid_r = r_indices[valid_mask]
+                    valid_c = c_indices[valid_mask]
+
+                    num_valid = len(valid_r)
+                    if num_valid > 0:
+                        pid_matched_atoms += num_valid
+                        p_coords = valid_pred_coords[valid_c]  # [num_valid, 3]
+                        grid_idx = torch.clamp(torch.round(p_coords / spacing).long(), 0, GRID_SIZE - 1)  # [num_valid, 3]
+
+                        logits = pred_res_logits[0, :, grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]  # [C_res, num_valid]
+                        pred_res = torch.argmax(logits[1:], dim=0) + 1  # [num_valid]
+                        gt_res = gt_res_indices[valid_r]  # [num_valid]
+
+                        pid_correct_residues += (pred_res == gt_res).sum()
+
+            avg_peaks_per_crop = (pid_resolved_peaks.float() / num_test_crops).item()
+            recovery_pct = (pid_matched_atoms.float() / pid_gt_atoms * 100 if pid_gt_atoms > 0 else torch.tensor(0.0)).item()
+            precision_pct = (pid_matched_atoms.float() / pid_resolved_peaks * 100 if pid_resolved_peaks > 0 else torch.tensor(0.0)).item()
             f1_pct = 2 * (precision_pct * recovery_pct) / (precision_pct + recovery_pct) if (precision_pct + recovery_pct) > 0 else 0.0
-            class_pct = (pid_correct_residues / pid_matched_atoms) * 100 if pid_matched_atoms > 0 else 0.0
+            class_pct = (pid_correct_residues.float() / pid_matched_atoms * 100 if pid_matched_atoms > 0 else torch.tensor(0.0)).item()
 
             print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Precision: {precision_pct:.1f}% | F1: {f1_pct:.1f}% | Classification: {class_pct:.1f}%")
+            tp = pid_matched_atoms.item()
+            fp = (pid_resolved_peaks - pid_matched_atoms).item()
+            fn = (pid_gt_atoms - pid_matched_atoms).item()
+            correct = pid_correct_residues.item()
+            total_peaks = pid_resolved_peaks.item()
+            gt_atoms = pid_gt_atoms.item()
+
             print(f"    Confusion Matrix (2x2):")
             print(f"                 Actual Atom   Actual Space")
-            print(f"      Pred Peak    TP: {pid_matched_atoms:<5}     FP: {pid_resolved_peaks - pid_matched_atoms:<5}")
-            print(f"      No Peak      FN: {pid_gt_atoms - pid_matched_atoms:<5}     TN: N/A")
+            print(f"      Pred Peak    TP: {tp:<5}     FP: {fp:<5}")
+            print(f"      No Peak      FN: {fn:<5}     TN: N/A")
 
             result_entry = {
                 "fold": fold_idx + 1, "pid": pid.upper(), "avg_peaks": avg_peaks_per_crop,
-                "gt_atoms": pid_gt_atoms, "matched_atoms": pid_matched_atoms,
+                "gt_atoms": gt_atoms, "matched_atoms": tp,
                 "recovery_pct": recovery_pct, "precision_pct": precision_pct, "f1_pct": f1_pct, "class_pct": class_pct
             }
             fold_pdb_results.append(result_entry)
             all_folds_pdb_results.append(result_entry)
 
-            global_gt_atoms += pid_gt_atoms
-            global_matched_atoms += pid_matched_atoms
-            global_correct_residues += pid_correct_residues
-            global_resolved_peaks += pid_resolved_peaks
+            global_gt_atoms += gt_atoms
+            global_matched_atoms += tp
+            global_correct_residues += correct
+            global_resolved_peaks += total_peaks
             global_num_crops += num_test_crops
 
         # Free VRAM memory to prevent leaks on Colab
@@ -869,21 +915,24 @@ if __name__ == "__main__":
     num_pf_epochs = 2 if device.type == "cpu" else 200
     for epoch in range(1, num_pf_epochs + 1):
         pairformer.train()
-        train_loss = 0.0
+        train_loss = torch.tensor(0.0, device=device)
         for tokens, target in pf_train:
             opt_pf.zero_grad()
             loss = criterion_pf(pairformer(tokens), target)  # scaler
             loss.backward()
             opt_pf.step()
-            train_loss += loss.item()
-        train_loss /= len(pf_train)
+            train_loss += loss.detach()
+        train_loss_val = train_loss.item() / len(pf_train)
 
         # Periodic evaluation & clean printing
         if epoch % 50 == 0 or epoch == 1:
             pairformer.eval()
             with torch.no_grad():
-                val_loss = sum(criterion_pf(pairformer(tok), tar).item() for tok, tar in pf_val) / len(pf_val)
-            print(f"Pairformer Epoch {epoch:03d}/200 | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+                val_loss_tensor = torch.tensor(0.0, device=device)
+                for tok, tar in pf_val:
+                    val_loss_tensor += criterion_pf(pairformer(tok), tar)
+                val_loss_val = val_loss_tensor.item() / len(pf_val)
+            print(f"Pairformer Epoch {epoch:03d}/200 | Train Loss: {train_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
 
     # Visual check on the first target with shape-watching enabled
     pairformer.eval()

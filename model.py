@@ -48,8 +48,7 @@ NUM_BLOCKS = 3
 MAX_REL_POS = 32
 CONTACT_THRESHOLD = 8.0
 
-torch.set_default_device('cuda')
-device = torch.device("cuda")
+torch.set_default_device("cuda")
 torch.set_float32_matmul_precision('high')
 
 # ==============================================================================
@@ -306,7 +305,7 @@ class SeqToPair(nn.Module):
         # s shape: [B, seq_len, c_s]
         s_q = self.linear_s_q(s).unsqueeze(2)  # [B, seq_len, 1, c_z]
         s_k = self.linear_s_k(s).unsqueeze(1)  # [B, 1, seq_len, c_z]
-        pos = torch.arange(s.shape[1], device=s.device)  # [seq_len]
+        pos = torch.arange(s.shape[1])  # [seq_len]
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # [seq_len, seq_len]
         rel_pos = self.emb(torch.clamp(diff, -self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos)  # [seq_len, seq_len, c_z]
         return s_q + s_k + rel_pos.unsqueeze(0)  # [B, seq_len, seq_len, c_z]
@@ -395,8 +394,9 @@ class TransitionBlock(nn.Module):
 
 
 class TriangleUpdate(nn.Module):
-    def __init__(self, c_z: int, c_hidden: int = 32):
+    def __init__(self, c_z: int, c_hidden: int = 32, orientation: str = "outgoing"):
         super().__init__()
+        self.orientation = orientation
         self.ln = nn.LayerNorm(c_z)
         self.lin_a = nn.Linear(c_z, c_hidden)
         self.lin_b = nn.Linear(c_z, c_hidden)
@@ -410,7 +410,14 @@ class TriangleUpdate(nn.Module):
         z_norm = self.ln(z)  # [B, N, N, c_z]
         a = torch.sigmoid(self.lin_gate_a(z_norm)) * self.lin_a(z_norm)  # [B, N, N, c_hidden]
         b = torch.sigmoid(self.lin_gate_b(z_norm)) * self.lin_b(z_norm)  # [B, N, N, c_hidden]
-        out = torch.einsum("b i k c, b j k c -> b i j c", a, b)  # [B, N, N, c_hidden]
+
+        if self.orientation == "outgoing":
+            out = torch.einsum("b i k c, b k j c -> b i j c", a, b)  # [B, N, N, c_hidden]
+        elif self.orientation == "incoming":
+            out = torch.einsum("b k i c, b k j c -> b i j c", a, b)  # [B, N, N, c_hidden]
+        else:
+            raise ValueError(f"Unknown orientation: {self.orientation}")
+
         final_out = self.lin_out(out) * torch.sigmoid(self.lin_gate_out(z_norm))  # [B, N, N, c_z]
 
         if shape_watch: print(f"    [Shape Watcher - TriangleMultiplicativeUpdate]\n      gathered_sum={list(out.shape)}")
@@ -425,7 +432,8 @@ class PairformerBlock(nn.Module):
         self.ln_s1 = nn.LayerNorm(c_s)
         self.transition_s = TransitionBlock(c_s, act_fn="gelu", dropout=dropout)
         self.opm = OuterProduct(c_s, c_z)
-        self.tri_mul = TriangleUpdate(c_z)
+        self.tri_mul_out = TriangleUpdate(c_z, orientation="outgoing")
+        self.tri_mul_in = TriangleUpdate(c_z, orientation="incoming")
         self.transition_z = TransitionBlock(c_z, act_fn="gelu", dropout=dropout)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
@@ -436,7 +444,8 @@ class PairformerBlock(nn.Module):
         s = s + self.dropout(self.attn(self.ln_s1(s), z, shape_watch=shape_watch))  # [B, N, c_s]
         s = s + self.dropout(self.transition_s(s))  # [B, N, c_s]
         z = z + self.dropout(self.opm(s, shape_watch=shape_watch))  # [B, N, N, c_z]
-        z = z + self.dropout(self.tri_mul(z, shape_watch=shape_watch))  # [B, N, N, c_z]
+        z = z + self.dropout(self.tri_mul_out(z, shape_watch=shape_watch))  # [B, N, N, c_z]
+        z = z + self.dropout(self.tri_mul_in(z, shape_watch=shape_watch))  # [B, N, N, c_z]
         z = z + self.dropout(self.transition_z(z))  # [B, N, N, c_z]
         if shape_watch: print("=== END PAIRFORMER BLOCK SHAPE-WATCHING ===\n")
         return s, z  # ([B, N, c_s], [B, N, N, c_z])
@@ -475,50 +484,69 @@ class ContactPredictor(nn.Module):
 # SECTION 4B: THE EM-PAIRFORMER ARCHITECTURE
 # ==============================================================================
 
-class InterUpdate(nn.Module):
-    def __init__(self, c_z: int, c_p: int, c_hidden: int, c_pz: int, outgoing: bool = True):
+class PairUpdate(nn.Module):
+    def __init__(self, c_pz: int, c_p: int, c_hidden: int = 16):
         super().__init__()
-        self.outgoing = outgoing
+        # Project point-residue features to point-point
+        self.opm = OuterProduct(c_pz, c_p, c_hidden=c_hidden)
         self.ln_p = nn.LayerNorm(c_p)
-        self.ln_z = nn.LayerNorm(c_z)
+        self.lin_p = nn.Linear(c_p, c_p)
+        self.ln_out = nn.LayerNorm(c_p)
+
+    def forward(self, pz: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        # pz shape: [B, N_point, N_res, c_pz]
+        # p shape: [B, N_point, N_point, c_p]
+        pz_trans = pz.transpose(1, 2)  # [B, N_res, N_point, c_pz]
+        pz_proj = self.opm(pz_trans)  # [B, N_point, N_point, c_p]
+
+        p_norm = self.ln_p(p)  # [B, N_point, N_point, c_p]
+        out = self.lin_p(p_norm) * torch.sigmoid(pz_proj)
+        return self.ln_out(out)
+
+
+class InterUpdate(nn.Module):
+    def __init__(self, c_in: int, c_pz: int, c_hidden: int, mode: str = "outgoing"):
+        super().__init__()
+        self.mode = mode
+        self.ln_in = nn.LayerNorm(c_in)
+        self.ln_pz = nn.LayerNorm(c_pz)
         self.ln_out = nn.LayerNorm(c_hidden)
 
-        self.lin_p_proj = nn.Linear(c_p, c_hidden)
-        self.lin_z_proj = nn.Linear(c_z, c_hidden)
-        self.lin_p_gate = nn.Linear(c_p, c_hidden)
-        self.lin_z_gate = nn.Linear(c_z, c_hidden)
+        self.lin_in_proj = nn.Linear(c_in, c_hidden)
+        self.lin_pz_proj = nn.Linear(c_pz, c_hidden)
+        self.lin_in_gate = nn.Linear(c_in, c_hidden)
+        self.lin_pz_gate = nn.Linear(c_pz, c_hidden)
         self.lin_out = nn.Linear(c_hidden, c_pz)
 
-    def forward(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        # z shape: [B, N_res, N_res, c_z]
-        # p shape: [B, N_point, N_point, c_p]
-        p_norm = self.ln_p(p)  # [B, N_point, N_point, c_p]
-        z_norm = self.ln_z(z)  # [B, N_res, N_res, c_z]
+    def forward(self, pz: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        # pz shape: [B, N_point, N_res, c_pz]
+        # mode == "outgoing": x is p (Point-Point) [B, N_point, N_point, c_p]
+        # mode == "incoming": x is z (Residue-Residue) [B, N_res, N_res, c_z]
+        pz_norm = self.ln_pz(pz)
+        x_norm = self.ln_in(x)
 
-        x_p = torch.sigmoid(self.lin_p_gate(p_norm)) * self.lin_p_proj(p_norm)  # [B, N_point, N_point, c_hidden]
-        x_z = torch.sigmoid(self.lin_z_gate(z_norm)) * self.lin_z_proj(z_norm)  # [B, N_res, N_res, c_hidden]
+        pz_proj = torch.sigmoid(self.lin_pz_gate(pz_norm)) * self.lin_pz_proj(pz_norm)  # [B, N_point, N_res, c_hidden]
+        x_proj = torch.sigmoid(self.lin_in_gate(x_norm)) * self.lin_in_proj(x_norm)  # [B, dim, dim, c_hidden]
 
-        if self.outgoing:
-            # sum over intermediate connections to find outgoing paths (dim -2)
-            z_p = x_p.sum(dim=-2)  # [B, N_point, c_hidden]
-            z_z = x_z.sum(dim=-2)  # [B, N_res, c_hidden]
+        if self.mode == "outgoing":
+            # sum over intermediate point k: p -> k (x_proj) and k -> r (pz_proj)
+            out = torch.einsum("b p k c, b k r c -> b p r c", x_proj, pz_proj)  # [B, N_point, N_res, c_hidden]
+        elif self.mode == "incoming":
+            # sum over intermediate residue k: p -> k (pz_proj) and k -> r (x_proj)
+            out = torch.einsum("b p k c, b k r c -> b p r c", pz_proj, x_proj)  # [B, N_point, N_res, c_hidden]
         else:
-            # incoming paths (dim -3)
-            z_p = x_p.sum(dim=-3)  # [B, N_point, c_hidden]
-            z_z = x_z.sum(dim=-3)  # [B, N_res, c_hidden]
+            raise ValueError(f"Unknown mode: {self.mode}")
 
-        out = torch.einsum("b p h, b r h -> b p r h", z_p, z_z)  # [B, N_point, N_res, c_hidden]
         return self.lin_out(self.ln_out(out))  # [B, N_point, N_res, c_pz]
 
 
 class EMBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, c_pz: int, c_p: int, n_heads: int = 4):
         super().__init__()
-        self.tri_mul_out = TriangleUpdate(c_z)
-        self.tri_mul_in = TriangleUpdate(c_z)
+        self.pair_update = PairUpdate(c_pz, c_p)
 
-        self.inter_outgoing = InterUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=True)
-        self.inter_incoming = InterUpdate(c_z, c_p, c_hidden=c_pz, c_pz=c_pz, outgoing=False)
+        self.inter_outgoing = InterUpdate(c_in=c_p, c_pz=c_pz, c_hidden=c_pz, mode="outgoing")
+        self.inter_incoming = InterUpdate(c_in=c_z, c_pz=c_pz, c_hidden=c_pz, mode="incoming")
 
         self.residue_row_attn = BiasedAttention(c_pz, c_z, c_pz, n_heads=n_heads, along_dim=-2, has_norms=True)
         self.point_column_attn = BiasedAttention(c_pz, c_p, c_pz, n_heads=n_heads, along_dim=-3, has_norms=True)
@@ -530,8 +558,7 @@ class EMBlock(nn.Module):
         self.transition_z = TransitionBlock(c_z, act_fn="gelu")
         self.c_s = c_s
         if c_s > 0:
-            self.attn = BiasedAttention(c_s, c_z, c_s, n_heads)
-            self.transition_s = TransitionBlock(c_s, act_fn="gelu")
+            self.pairformer_module = PairformerBlock(c_s, c_z, n_heads)
 
     def forward(self, s: torch.Tensor | None, z: torch.Tensor, pz: torch.Tensor, p: torch.Tensor, shape_watch: bool = False) -> tuple:
         # s shape: [B, N_res, c_s] or None
@@ -541,24 +568,24 @@ class EMBlock(nn.Module):
         if shape_watch:
             print(f"    [Shape Watcher - EMPairformerBlock Input]\n      s={list(s.shape) if s is not None else None}, z={list(z.shape)}, pz={list(pz.shape)}, p={list(p.shape)}")
 
-        z = z + self.tri_mul_out(z)  # [B, N_res, N_res, c_z]
-        z = z + self.tri_mul_in(z)  # [B, N_res, N_res, c_z]
+        # 1. Pair Update (Updates Point-Point using Point-Residue)
+        p = p + self.pair_update(pz, p)
 
-        pz = pz + self.inter_outgoing(z, p)  # [B, N_point, N_res, c_pz]
-        pz = pz + self.inter_incoming(z, p)  # [B, N_point, N_res, c_pz]
-        pz = pz + self.residue_row_attn(pz, z)  # [B, N_point, N_res, c_pz]
-        pz = pz + self.point_column_attn(pz, p)  # [B, N_point, N_res, c_pz]
-        pz = pz + self.pz_transition(pz)  # [B, N_point, N_res, c_pz]
+        # 2. Sequential Point-Residue Updates (Pink Blocks)
+        pz = pz + self.inter_outgoing(pz, p)          # Out Inter Update
+        pz = pz + self.inter_incoming(pz, z)          # In Inter Update
+        pz = pz + self.residue_row_attn(pz, z)        # Row-wise Attention (biased by z)
+        pz = pz + self.point_column_attn(pz, p)       # Column-wise Attention (biased by p)
+        pz = pz + self.pz_transition(pz)              # Transition
 
-        # update z from pz (averaging over point axis)
-        z = z + self.outer_row_opm(pz)  # [B, N_res, N_res, c_z]
-        # update p from pz (averaging over residue axis)
-        p = p + self.outer_col_opm(pz.transpose(1, 2))  # [B, N_point, N_point, c_p]
-        z = z + self.transition_z(z)  # [B, N_res, N_res, c_z]
+        # 3. Outer Product Means (Purple Blocks)
+        z = z + self.outer_row_opm(pz)                # Outer Product Mean
+        p = p + self.outer_col_opm(pz.transpose(1, 2))  # Trans. Outer Product Mean
+        z = z + self.transition_z(z)                  # Residue Transition
 
+        # 4. Final Pairformer Module Pass (Blue Block)
         if self.c_s > 0 and s is not None:
-            s = s + self.attn(s, z, shape_watch=shape_watch)  # [B, N_res, c_s]
-            s = s + self.transition_s(s)  # [B, N_res, c_s]
+            s, z = self.pairformer_module(s, z, shape_watch=shape_watch)
 
         return s, z, pz, p  # shapes: ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
 
@@ -627,8 +654,8 @@ if __name__ == "__main__":
     print("="*70)
 
     K_FOLDS = 5
-    NUM_EPOCHS = 1 if device.type == "cpu" else 250
-    steps_per_epoch = 1 if device.type == "cpu" else 25
+    NUM_EPOCHS = 250
+    steps_per_epoch = 25
     MATCHING_RADIUS = 1.5
     spacing = BOX_SIZE / (GRID_SIZE - 1)
 
@@ -692,7 +719,7 @@ if __name__ == "__main__":
         # Train loop
         for epoch in range(1, NUM_EPOCHS + 1):
             unet_atom.train(); unet_res.train()
-            epoch_loss = torch.tensor(0.0, device=device)
+            epoch_loss = torch.tensor(0.0)
             for _ in range(steps_per_epoch):
                 samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
                 inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
@@ -719,8 +746,8 @@ if __name__ == "__main__":
             if epoch % 50 == 0 or epoch == 1:
                 unet_atom.eval(); unet_res.eval()
                 with torch.no_grad():
-                    val_loss = torch.tensor(0.0, device=device)
-                    val_steps = 1 if device.type == "cpu" else 5
+                    val_loss = torch.tensor(0.0)
+                    val_steps = 5
                     for _ in range(val_steps):
                         val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
                         val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
@@ -742,8 +769,8 @@ if __name__ == "__main__":
 
         # Restore best model for testing
         if best_atom_state is not None:
-            unet_atom.load_state_dict({k: v.to(device) for k, v in best_atom_state.items()})
-            unet_res.load_state_dict({k: v.to(device) for k, v in best_res_state.items()})
+            unet_atom.load_state_dict(best_atom_state)
+            unet_res.load_state_dict(best_res_state)
 
         # Test Evaluation for this fold
         print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
@@ -751,15 +778,15 @@ if __name__ == "__main__":
         peak_finder = PeakFinder()
 
         fold_pdb_results = []
-        num_test_crops = 1 if device.type == "cpu" else 10  # 10 random crops per unseen test target
+        num_test_crops = 10  # 10 random crops per unseen test target
 
         for pid in test_pids:
             # Single PDB subset
             test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
-            pid_gt_atoms = torch.tensor(0, dtype=torch.long, device=device)
-            pid_matched_atoms = torch.tensor(0, dtype=torch.long, device=device)
-            pid_correct_residues = torch.tensor(0, dtype=torch.long, device=device)
-            pid_resolved_peaks = torch.tensor(0, dtype=torch.long, device=device)
+            pid_gt_atoms = torch.tensor(0, dtype=torch.long)
+            pid_matched_atoms = torch.tensor(0, dtype=torch.long)
+            pid_correct_residues = torch.tensor(0, dtype=torch.long)
+            pid_resolved_peaks = torch.tensor(0, dtype=torch.long)
 
             with torch.no_grad():
                 for _ in range(num_test_crops):
@@ -787,8 +814,8 @@ if __name__ == "__main__":
                     N_gt, M_pred = dists_temp.shape
                     K_matches = min(N_gt, M_pred)
 
-                    r_indices = torch.zeros(K_matches, dtype=torch.long, device=device)
-                    c_indices = torch.zeros(K_matches, dtype=torch.long, device=device)
+                    r_indices = torch.zeros(K_matches, dtype=torch.long)
+                    c_indices = torch.zeros(K_matches, dtype=torch.long)
 
                     for i in range(K_matches):
                         min_idx = torch.argmin(dists_temp)
@@ -909,7 +936,7 @@ if __name__ == "__main__":
 
     for epoch in range(1, num_pf_epochs + 1):
         pairformer.train()
-        train_loss = torch.tensor(0.0, device=device)
+        train_loss = torch.tensor(0.0)
         for tokens, target in pf_train:
             opt_pf.zero_grad()
             loss = criterion_pf(pairformer(tokens), target)  # scaler
@@ -924,7 +951,7 @@ if __name__ == "__main__":
         # Evaluate validation loss every epoch to find the best checkpoint
         pairformer.eval()
         with torch.no_grad():
-            val_loss_tensor = torch.tensor(0.0, device=device)
+            val_loss_tensor = torch.tensor(0.0)
             for tok, tar in pf_val:
                 val_loss_tensor += criterion_pf(pairformer(tok), tar)
             val_loss_val = val_loss_tensor.item() / len(pf_val)

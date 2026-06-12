@@ -8,6 +8,7 @@ import biotite.structure.io.pdbx as pdbx
 import biotite.database.rcsb as rcsb
 from tqdm import tqdm
 from sklearn.model_selection import KFold
+from scipy.optimize import linear_sum_assignment
 from einops import rearrange
 
 
@@ -809,24 +810,11 @@ if __name__ == "__main__":
                     # Compute dists on GPU
                     dists = torch.cdist(gt_coords, valid_pred_coords)  # [N_cropped, M_pred]
 
-                    # Zero-sync Greedy Bipartite Matching on GPU
-                    dists_temp = dists.clone()
-                    N_gt, M_pred = dists_temp.shape
-                    K_matches = min(N_gt, M_pred)
-
-                    r_indices = torch.zeros(K_matches, dtype=torch.long)
-                    c_indices = torch.zeros(K_matches, dtype=torch.long)
-
-                    for i in range(K_matches):
-                        min_idx = torch.argmin(dists_temp)
-                        r = min_idx // M_pred
-                        c = min_idx % M_pred
-
-                        r_indices[i] = r
-                        c_indices[i] = c
-
-                        dists_temp[r, :] = float('inf')
-                        dists_temp[:, c] = float('inf')
+                    # Convert to CPU for Hungarian algorithm (scipy) to avoid GPU-CPU sync inside the loop
+                    dists_cpu = dists.cpu().numpy()
+                    r_indices, c_indices = linear_sum_assignment(dists_cpu)
+                    r_indices = torch.from_numpy(r_indices).to(dists.device)
+                    c_indices = torch.from_numpy(c_indices).to(dists.device)
 
                     # Filter matches that are within the MATCHING_RADIUS
                     matched_dists = dists[r_indices, c_indices]

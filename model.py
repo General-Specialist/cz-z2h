@@ -377,14 +377,16 @@ class OuterProduct(nn.Module):
 
 
 class TransitionBlock(nn.Module):
-    def __init__(self, c_in: int, n: int = 4, act_fn: str = "gelu"):
+    def __init__(self, c_in: int, n: int = 4, act_fn: str = "gelu", dropout: float = 0.0):
         super().__init__()
         act = nn.GELU() if act_fn == "gelu" else nn.ReLU()
         self.net = nn.Sequential(
             nn.LayerNorm(c_in),
             nn.Linear(c_in, n * c_in),
             act,
-            nn.Linear(n * c_in, c_in)
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
+            nn.Linear(n * c_in, c_in),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -417,32 +419,33 @@ class TriangleUpdate(nn.Module):
 
 
 class PairformerBlock(nn.Module):
-    def __init__(self, c_s: int, c_z: int, n_heads: int = 4):
+    def __init__(self, c_s: int, c_z: int, n_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         self.attn = BiasedAttention(c_s, c_z, c_s, n_heads, along_dim=-2)
         self.ln_s1 = nn.LayerNorm(c_s)
-        self.transition_s = TransitionBlock(c_s, act_fn="gelu")
+        self.transition_s = TransitionBlock(c_s, act_fn="gelu", dropout=dropout)
         self.opm = OuterProduct(c_s, c_z)
         self.tri_mul = TriangleUpdate(c_z)
-        self.transition_z = TransitionBlock(c_z, act_fn="gelu")
+        self.transition_z = TransitionBlock(c_z, act_fn="gelu", dropout=dropout)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         # s shape: [B, N, c_s]
         # z shape: [B, N, N, c_z]
         if shape_watch: print("\n=== STARTING PAIRFORMER BLOCK SHAPE-WATCHING ===")
-        s = s + self.attn(self.ln_s1(s), z, shape_watch=shape_watch)  # [B, N, c_s]
-        s = s + self.transition_s(s)  # [B, N, c_s]
-        z = z + self.opm(s, shape_watch=shape_watch)  # [B, N, N, c_z]
-        z = z + self.tri_mul(z, shape_watch=shape_watch)  # [B, N, N, c_z]
-        z = z + self.transition_z(z)  # [B, N, N, c_z]
+        s = s + self.dropout(self.attn(self.ln_s1(s), z, shape_watch=shape_watch))  # [B, N, c_s]
+        s = s + self.dropout(self.transition_s(s))  # [B, N, c_s]
+        z = z + self.dropout(self.opm(s, shape_watch=shape_watch))  # [B, N, N, c_z]
+        z = z + self.dropout(self.tri_mul(z, shape_watch=shape_watch))  # [B, N, N, c_z]
+        z = z + self.dropout(self.transition_z(z))  # [B, N, N, c_z]
         if shape_watch: print("=== END PAIRFORMER BLOCK SHAPE-WATCHING ===\n")
         return s, z  # ([B, N, c_s], [B, N, N, c_z])
 
 
 class Pairformer(nn.Module):
-    def __init__(self, c_s: int, c_z: int, n_blocks: int = 3, n_heads: int = 4):
+    def __init__(self, c_s: int, c_z: int, n_blocks: int = 3, n_heads: int = 4, dropout: float = 0.0):
         super().__init__()
-        self.blocks = nn.ModuleList([PairformerBlock(c_s, c_z, n_heads) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([PairformerBlock(c_s, c_z, n_heads, dropout) for _ in range(n_blocks)])
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, shape_watch_first: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         # s shape: [B, N, c_s], z shape: [B, N, N, c_z]
@@ -452,11 +455,11 @@ class Pairformer(nn.Module):
 
 
 class ContactPredictor(nn.Module):
-    def __init__(self, vocab_size: int, c_s: int = 64, c_z: int = 32, n_blocks: int = 3, n_heads: int = 4, max_rel_pos: int = 32):
+    def __init__(self, vocab_size: int, c_s: int = 64, c_z: int = 32, n_blocks: int = 3, n_heads: int = 4, max_rel_pos: int = 32, dropout: float = 0.0):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
         self.initializer = SeqToPair(c_s, c_z)
-        self.pairformer = Pairformer(c_s, c_z, n_blocks, n_heads)
+        self.pairformer = Pairformer(c_s, c_z, n_blocks, n_heads, dropout)
         self.contact_head = nn.Sequential(
             nn.LayerNorm(c_z), nn.Linear(c_z, 16), nn.ReLU(), nn.Linear(16, 1)
         )
@@ -467,19 +470,6 @@ class ContactPredictor(nn.Module):
         z = self.initializer(s)  # [B, N, N, c_z]
         s, z = self.pairformer(s, z, shape_watch_first=shape_watch)  # ([B, N, c_s], [B, N, N, c_z])
         return self.contact_head(z).squeeze(-1)  # [B, N, N]
-
-
-def print_ascii_contact_map(gt: torch.Tensor, pred: torch.Tensor, threshold: float = 0.5):
-    N = gt.shape[0]
-    step = max(1, N // 35)
-    print("\n   GROUND TRUTH CONTACT MAP" + " " * 18 + "PREDICTED CONTACT MAP")
-    print("   " + "-" * (N // step) + "      " + "-" * (N // step))
-    for i in range(0, N, step):
-        row_gt = "".join("#" if gt[i, j] else "." for j in range(0, N, step))
-        row_pred = "".join("#" if pred[i, j] > threshold else "." for j in range(0, N, step))
-        print(f"{i:2d} {row_gt}      {i:2d} {row_pred}")
-    print("   " + "-" * (N // step) + "      " + "-" * (N // step) + "\n")
-
 
 # ==============================================================================
 # SECTION 4B: THE EM-PAIRFORMER ARCHITECTURE
@@ -743,7 +733,7 @@ if __name__ == "__main__":
                         val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res)
                     val_loss_val = val_loss.item() / val_steps
 
-                print(f"Fold {fold_idx + 1} | Epoch {epoch:03d}/100 | Train Loss: {epoch_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
+                print(f"Fold {fold_idx + 1} | Epoch {epoch:03d}/{NUM_EPOCHS} | Train Loss: {epoch_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -896,9 +886,10 @@ if __name__ == "__main__":
     print("="*70)
 
     pairformer = torch.compile(ContactPredictor(
-        vocab_size=len(RESIDUE_MAP), c_s=EMBED_DIM_S, c_z=EMBED_DIM_Z, n_blocks=NUM_BLOCKS, n_heads=NUM_HEADS
+        vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, n_blocks=1, n_heads=2, dropout=0.4
     ))
-    opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.002)
+    opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.0003, weight_decay=5e-3)
+    sched_pf = torch.optim.lr_scheduler.CosineAnnealingLR(opt_pf, T_max=200, eta_min=1e-6)
     criterion_pf = nn.BCEWithLogitsLoss()
 
     # Precompute static target contacts to optimize speed and reduce lines
@@ -911,8 +902,11 @@ if __name__ == "__main__":
     pf_train = pf_dataset[:-2]
     pf_val = pf_dataset[-2:]
 
-    # Train 200 epochs on contact maps (scaled down on CPU)
-    num_pf_epochs = 2 if device.type == "cpu" else 200
+    # Train 200 epochs on contact maps
+    num_pf_epochs = 200
+    best_val_loss = float('inf')
+    best_pf_state = None
+
     for epoch in range(1, num_pf_epochs + 1):
         pairformer.train()
         train_loss = torch.tensor(0.0, device=device)
@@ -924,15 +918,30 @@ if __name__ == "__main__":
             train_loss += loss.detach()
         train_loss_val = train_loss.item() / len(pf_train)
 
+        # Step the learning rate scheduler
+        sched_pf.step()
+
+        # Evaluate validation loss every epoch to find the best checkpoint
+        pairformer.eval()
+        with torch.no_grad():
+            val_loss_tensor = torch.tensor(0.0, device=device)
+            for tok, tar in pf_val:
+                val_loss_tensor += criterion_pf(pairformer(tok), tar)
+            val_loss_val = val_loss_tensor.item() / len(pf_val)
+
+        if val_loss_val < best_val_loss:
+            best_val_loss = val_loss_val
+            best_pf_state = {k: v.clone() for k, v in pairformer.state_dict().items()}
+
         # Periodic evaluation & clean printing
-        if epoch % 50 == 0 or epoch == 1:
-            pairformer.eval()
-            with torch.no_grad():
-                val_loss_tensor = torch.tensor(0.0, device=device)
-                for tok, tar in pf_val:
-                    val_loss_tensor += criterion_pf(pairformer(tok), tar)
-                val_loss_val = val_loss_tensor.item() / len(pf_val)
-            print(f"Pairformer Epoch {epoch:03d}/200 | Train Loss: {train_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
+        if epoch % 10 == 0 or epoch == 1 or epoch == num_pf_epochs:
+            current_lr = opt_pf.param_groups[0]['lr']
+            print(f"Pairformer Epoch {epoch:03d}/{num_pf_epochs} | LR: {current_lr:.6f} | Train Loss: {train_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
+
+    # Restore best checkpoint
+    if best_pf_state is not None:
+        pairformer.load_state_dict(best_pf_state)
+        print(f"Loaded best Pairformer checkpoint with Val Loss: {best_val_loss:.4f}")
 
     # Visual check on the first target with shape-watching enabled
     pairformer.eval()
@@ -942,8 +951,6 @@ if __name__ == "__main__":
         vis_tokens = vis_s["s_seq"].unsqueeze(0)  # [1, seq_len] (long)
         vis_pred = torch.sigmoid(pairformer(vis_tokens, shape_watch=True)).squeeze(0).cpu()  # [seq_len, seq_len]
         vis_gt = (torch.cdist(vis_s["s_coords"].unsqueeze(0), vis_s["s_coords"].unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float()  # [seq_len, seq_len]
-        print(f"\nCompleted run. Contact Map ASCII Visual check for {vis_key.upper()}:")
-        print_ascii_contact_map(vis_gt, vis_pred, threshold=0.5)
     print("\n" + "="*70)
     print(" PIPELINE 3: MATHEMATICAL DYNAMIC SHAPE WATCHING OF EM-PAIRFORMER ")
     print("="*70)

@@ -44,9 +44,10 @@ PDB_IDS = [
 GRID_SIZE = 64
 BOX_SIZE = 32.0
 RADIUS = 1.5
+ATOM_RADIUS = 1.0
 
 # Mean-Shift Peak Finding Constants
-PEAK_THRESHOLD = 0.30
+PEAK_THRESHOLD = 0.20
 PEAK_BANDWIDTH = 1.0
 MAX_PEAKS = 512
 PEAK_ITERATIONS = 5
@@ -74,44 +75,57 @@ def download_pdb_cif(pdb_id: str) -> str:
     return str(path)
 
 
-def rasterize_structure(coords: torch.Tensor, res_indices: torch.Tensor, sigma: float = 0.8, radius: float = 0.8, res_radius: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def rasterize_structure(all_coords: torch.Tensor, ca_coords: torch.Tensor, ca_res_indices: torch.Tensor, sigma: float = 0.8, radius: float = 0.8, res_radius: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vectorized, chunk-free grid rasterization using torch.cdist.
     """
-    # coords shape: [N_atoms, 3]
-    # res_indices shape: [N_atoms] (long)
     ticks = torch.linspace(0.0, BOX_SIZE, GRID_SIZE)  # [GRID_SIZE]
     grid_x, grid_y, grid_z = torch.meshgrid(ticks, ticks, ticks, indexing='ij')  # each [GRID_SIZE, GRID_SIZE, GRID_SIZE]
     grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)  # [GRID_SIZE^3, 3]
 
-    dists = torch.cdist(grid, coords)  # [GRID_SIZE^3, N_atoms]
-    density = torch.exp(-dists**2 / (2 * sigma**2)).sum(dim=-1).view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
-    binary_grid = (dists <= radius).any(dim=-1).float().view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
+    # Input density from all atoms
+    dists_all = torch.cdist(grid, all_coords)  # [GRID_SIZE^3, N_atoms]
+    density = torch.exp(-dists_all**2 / (2 * sigma**2)).sum(dim=-1).view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-    min_dists, min_idx = torch.min(dists, dim=-1)  # min_dists: [GRID_SIZE^3], min_idx: [GRID_SIZE^3] (long)
-    residue_grid = torch.where(min_dists <= res_radius, res_indices[min_idx], 0)
+    # Target grids from C-alpha coordinates (support points)
+    dists_ca = torch.cdist(grid, ca_coords)  # [GRID_SIZE^3, N_ca_atoms]
+    binary_grid = (dists_ca <= radius).any(dim=-1).float().view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
+
+    min_dists, min_idx = torch.min(dists_ca, dim=-1)  # min_dists: [GRID_SIZE^3], min_idx: [GRID_SIZE^3] (long)
+    residue_grid = torch.where(min_dists <= res_radius, ca_res_indices[min_idx], 0)
 
     return density, binary_grid, residue_grid.view(GRID_SIZE, GRID_SIZE, GRID_SIZE)  # returned as density/binary_grid: [GRID_SIZE, GRID_SIZE, GRID_SIZE], residue_grid: [GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
 
 def crop_and_rasterize_dynamic(structures: list, is_training: bool = False, return_coords: bool = False) -> tuple:
-    coords, res_indices = random.choice(structures)  # coords: [N_atoms, 3], res_indices: [N_atoms] (long)
-    center = coords[torch.randint(0, len(coords), (1,))].squeeze(0)  # [3]
+    s_dict = random.choice(structures)
+    v_coords = s_dict["v_coords"]  # all atoms
+    s_coords = s_dict["s_coords"]  # C-alpha atoms
+    s_seq = s_dict["s_seq"]  # C-alpha sequence
+
+    center = s_coords[torch.randint(0, len(s_coords), (1,))].squeeze(0)
+    if is_training:
+        center = center + (torch.rand(3, device=s_coords.device) - 0.5) * 4.0
 
     half_box = BOX_SIZE / 2.0
-    mask = torch.all((coords >= center - half_box) & (coords <= center + half_box), dim=-1)  # [N_atoms] (bool)
+    v_mask = torch.all((v_coords >= center - half_box) & (v_coords <= center + half_box), dim=-1)
+    s_mask = torch.all((s_coords >= center - half_box) & (s_coords <= center + half_box), dim=-1)
 
-    cropped_coords = coords[mask] - center + half_box  # [N_cropped, 3]
-    cropped_res = res_indices[mask]  # [N_cropped] (long)
+    cropped_v_coords = v_coords[v_mask] - center + half_box
+    cropped_s_coords = s_coords[s_mask] - center + half_box
+    cropped_s_seq = s_seq[s_mask]
 
     sigma = random.uniform(0.8, 1.8) if is_training else 1.2
     noise = random.uniform(0.01, 0.08) if is_training else 0.04
 
-    density, binary_grid, residue_grid = rasterize_structure(cropped_coords, cropped_res, sigma=sigma, radius=RADIUS, res_radius=1.0)
+    density, binary_grid, residue_grid = rasterize_structure(
+        cropped_v_coords, cropped_s_coords, cropped_s_seq,
+        sigma=sigma, radius=ATOM_RADIUS, res_radius=RADIUS
+    )
 
-    out_density = F.relu(density + torch.randn_like(density) * noise)  # [GRID_SIZE, GRID_SIZE, GRID_SIZE]
+    out_density = F.relu(density + torch.randn_like(density) * noise)
     if return_coords:
-        return out_density, binary_grid, residue_grid, cropped_coords, cropped_res
+        return out_density, binary_grid, residue_grid, cropped_s_coords, cropped_s_seq
     return out_density, binary_grid, residue_grid
 
 
@@ -154,7 +168,7 @@ def find_groups(c: int) -> int:
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_c: int, out_c: int, dropout: float = 0.3):
+    def __init__(self, in_c: int, out_c: int, dropout: float = 0.4):
         super().__init__()
         self.net = nn.Sequential(
             nn.GroupNorm(find_groups(in_c), in_c), nn.SiLU(),
@@ -718,8 +732,8 @@ if __name__ == "__main__":
     print(" PIPELINE 1: TRAINING VOLUMETRIC U-NET ")
     print("="*70)
 
-    NUM_EPOCHS = 500
-    steps_per_epoch = 25
+    NUM_EPOCHS = 200
+    steps_per_epoch = 50
     MATCHING_RADIUS = 1.5
     spacing = BOX_SIZE / (GRID_SIZE - 1)
 
@@ -748,16 +762,16 @@ if __name__ == "__main__":
     print(f"Test structures ({len(test_pids)}): {[p.upper() for p in test_pids]}")
 
     # Construct splits
-    v_train = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in train_pids]
-    v_val = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in val_pids]
-    v_test = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in test_pids]
+    v_train = [all_structures[pid] for pid in train_pids]
+    v_val = [all_structures[pid] for pid in val_pids]
+    v_test = [all_structures[pid] for pid in test_pids]
 
     # Initialize models
     unet_atom = UNet(1, 1, init_features=16)
     # unet_res now takes 2 channels: density + detached atom prediction
     unet_res = UNet(2, len(RESIDUE_MAP) + 1, init_features=32)
-    opt_unet = torch.optim.AdamW(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001, weight_decay=1e-4)
-    scheduler_unet = torch.optim.lr_scheduler.StepLR(opt_unet, step_size=60, gamma=0.5)
+    opt_unet = torch.optim.AdamW(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001, weight_decay=0.01)
+    scheduler_unet = torch.optim.lr_scheduler.CosineAnnealingLR(opt_unet, T_max=NUM_EPOCHS, eta_min=1e-6)
     criterion_atom = BCEDiceLoss()
     # Add label smoothing to regularize the residue classification
     criterion_res = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
@@ -787,10 +801,10 @@ if __name__ == "__main__":
         unet_atom.train(); unet_res.train()
         epoch_loss = torch.tensor(0.0)
         for _ in range(steps_per_epoch):
-            samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
-            inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-            target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-            target_res = torch.stack([s[2] for s in samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
+            samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(8)]
+            inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [8, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1)  # [8, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            target_res = torch.stack([s[2] for s in samples]).long()  # [8, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
             inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)  # shapes same as above
 
@@ -814,12 +828,12 @@ if __name__ == "__main__":
             unet_atom.eval(); unet_res.eval()
             with torch.no_grad():
                 val_loss = torch.tensor(0.0)
-                val_steps = 5
+                val_steps = 20
                 for _ in range(val_steps):
-                    val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
-                    val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                    val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                    val_target_res = torch.stack([s[2] for s in val_samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
+                    val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(8)]
+                    val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1)  # [8, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1)  # [8, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    val_target_res = torch.stack([s[2] for s in val_samples]).long()  # [8, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
                     val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)  # shapes same as above
                     val_res_inputs = torch.cat([val_inputs, torch.sigmoid(val_pred_atom).detach()], dim=1)
@@ -854,7 +868,7 @@ if __name__ == "__main__":
 
     for pid in test_pids:
         # Single PDB subset
-        test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
+        test_target_structure = [all_structures[pid]]
         pid_gt_atoms = torch.tensor(0, dtype=torch.long)
         pid_matched_atoms = torch.tensor(0, dtype=torch.long)
         pid_correct_residues = torch.tensor(0, dtype=torch.long)
@@ -867,7 +881,7 @@ if __name__ == "__main__":
                 )  # test_input: [GRID_SIZE, GRID_SIZE, GRID_SIZE], gt_coords: [N_cropped, 3], gt_res_indices: [N_cropped] (long)
                 test_in_batch = test_input.unsqueeze(0).unsqueeze(0)  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                pred_density = torch.sigmoid(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
                 pred_coords, pred_vals, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_vals: [1, M], pred_mask: [1, M] (bool)
                 test_res_inputs = torch.cat([test_in_batch, pred_density.detach()], dim=1)
                 pred_res_logits = unet_res(test_res_inputs)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
@@ -971,7 +985,7 @@ if __name__ == "__main__":
     print("="*70)
 
     pairformer = ContactPredictor(
-        vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, n_blocks=1, n_heads=2, dropout=0.4
+        vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, n_blocks=NUM_BLOCKS, n_heads=2, dropout=0.4
     )
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.0003, weight_decay=5e-3)
     sched_pf = torch.optim.lr_scheduler.CosineAnnealingLR(opt_pf, T_max=200, eta_min=1e-6)
@@ -1041,7 +1055,7 @@ if __name__ == "__main__":
     print("="*70)
 
     em_model = EMContactPredictor(
-        vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, c_pz=16, c_p=16, n_blocks=1, n_heads=2
+        vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, c_pz=16, c_p=16, n_blocks=NUM_BLOCKS, n_heads=2
     )
     opt_em = torch.optim.Adam(em_model.parameters(), lr=0.0003, weight_decay=5e-3)
     sched_em = torch.optim.lr_scheduler.CosineAnnealingLR(opt_em, T_max=100, eta_min=1e-6)
@@ -1051,35 +1065,41 @@ if __name__ == "__main__":
     struct_keys = list(all_structures.keys())
     em_train_pids = struct_keys[:-2]
     em_val_pids = struct_keys[-2:]
-
     num_em_epochs = 100
     best_em_val_loss = float('inf')
     best_em_state = None
 
-    noise_std = 1.0  # 1.0 Å noise to simulate peak uncertainty
-
     for epoch in range(1, num_em_epochs + 1):
         em_model.train()
+        unet_atom.eval(); unet_res.eval()
         train_loss = torch.tensor(0.0)
+        train_count = 0
 
         for pid in em_train_pids:
-            s = all_structures[pid]
-            tokens = s["s_seq"].unsqueeze(0)  # [1, N_res]
-            res_coords = s["s_coords"].unsqueeze(0)  # [1, N_res, 3]
-            N_res = tokens.shape[1]
+            test_target_structure = [all_structures[pid]]
+            with torch.no_grad():
+                test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
+                    test_target_structure, is_training=True, return_coords=True
+                )  # test_input: [GRID_SIZE, GRID_SIZE, GRID_SIZE], gt_coords: [N_cropped, 3], gt_res_indices: [N_cropped] (long)
+                test_in_batch = test_input.unsqueeze(0).unsqueeze(0)
+                pred_density = torch.sigmoid(unet_atom(test_in_batch))
+                pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+                
+                valid_pred_mask = pred_mask[0]
+                if not valid_pred_mask.any():
+                    continue
+                p_coords = pred_coords[:, valid_pred_mask, :]  # [1, M_pred, 3]
+                p_densities = pred_vals[:, valid_pred_mask]  # [1, M_pred]
 
-            # Ground truth residue contacts
+            tokens = gt_res_indices.unsqueeze(0)  # [1, N_cropped]
+            res_coords = gt_coords.unsqueeze(0)  # [1, N_cropped, 3]
+
+            # Ground truth residue contacts within the crop
             target_z = (torch.cdist(res_coords, res_coords) < CONTACT_THRESHOLD).float()
 
-            # Generate noisy and permuted points
-            perm = torch.randperm(N_res)
-            p_coords = (res_coords + torch.randn_like(res_coords) * noise_std)[:, perm, :]
-            p_densities = torch.ones((1, N_res)) + torch.randn((1, N_res)) * 0.1
-
-            # Ground truth point-residue matching
-            target_pz = torch.zeros((1, N_res, N_res))
-            for i, p_idx in enumerate(perm):
-                target_pz[0, i, p_idx] = 1.0
+            # Ground truth point-residue matching within the crop
+            dists = torch.cdist(p_coords[0], gt_coords)  # [M_pred, N_cropped]
+            target_pz = (dists < MATCHING_RADIUS).float().unsqueeze(0)  # [1, M_pred, N_cropped]
 
             opt_em.zero_grad()
             pred_z, pred_pz = em_model(tokens, p_coords, p_densities, res_coords)
@@ -1087,33 +1107,42 @@ if __name__ == "__main__":
             loss.backward()
             opt_em.step()
             train_loss += loss.detach()
+            train_count += 1
 
-        train_loss_val = train_loss.item() / len(em_train_pids)
+        train_loss_val = train_loss.item() / max(train_count, 1)
         sched_em.step()
 
         # Validation
         em_model.eval()
         with torch.no_grad():
             val_loss_tensor = torch.tensor(0.0)
+            val_count = 0
             for pid in em_val_pids:
-                s = all_structures[pid]
-                tokens = s["s_seq"].unsqueeze(0)
-                res_coords = s["s_coords"].unsqueeze(0)
-                N_res = tokens.shape[1]
+                test_target_structure = [all_structures[pid]]
+                test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
+                    test_target_structure, is_training=False, return_coords=True
+                )
+                test_in_batch = test_input.unsqueeze(0).unsqueeze(0)
+                pred_density = torch.sigmoid(unet_atom(test_in_batch))
+                pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+                
+                valid_pred_mask = pred_mask[0]
+                if not valid_pred_mask.any():
+                    continue
+                p_coords = pred_coords[:, valid_pred_mask, :]
+                p_densities = pred_vals[:, valid_pred_mask]
+                tokens = gt_res_indices.unsqueeze(0)
+                res_coords = gt_coords.unsqueeze(0)
 
                 target_z = (torch.cdist(res_coords, res_coords) < CONTACT_THRESHOLD).float()
-                perm = torch.arange(N_res)  # keep sequential for validation stability
-                p_coords = (res_coords + torch.randn_like(res_coords) * noise_std)[:, perm, :]
-                p_densities = torch.ones((1, N_res))
-
-                target_pz = torch.zeros((1, N_res, N_res))
-                for i, p_idx in enumerate(perm):
-                    target_pz[0, i, p_idx] = 1.0
+                dists = torch.cdist(p_coords[0], gt_coords)
+                target_pz = (dists < MATCHING_RADIUS).float().unsqueeze(0)
 
                 pred_z, pred_pz = em_model(tokens, p_coords, p_densities, res_coords)
                 val_loss_tensor += criterion_em(pred_z, target_z) + criterion_em(pred_pz, target_pz)
+                val_count += 1
 
-            val_loss_val = val_loss_tensor.item() / len(em_val_pids)
+            val_loss_val = val_loss_tensor.item() / max(val_count, 1)
 
         if val_loss_val < best_em_val_loss:
             best_em_val_loss = val_loss_val
@@ -1130,15 +1159,23 @@ if __name__ == "__main__":
     # Final Shape Watcher Verification Pass
     print("\nRunning shape-watching verification pass with trained EM-Pairformer:")
     em_model.eval()
+    unet_atom.eval(); unet_res.eval()
     with torch.no_grad():
-        s = all_structures[em_val_pids[0]]
-        tokens = s["s_seq"].unsqueeze(0)
-        res_coords = s["s_coords"].unsqueeze(0)
+        test_target_structure = [all_structures[em_val_pids[0]]]
+        test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
+            test_target_structure, is_training=False, return_coords=True
+        )
+        test_in_batch = test_input.unsqueeze(0).unsqueeze(0)
+        pred_density = torch.sigmoid(unet_atom(test_in_batch))
+        pred_coords, pred_vals, pred_mask = peak_finder(pred_density)
+        
+        valid_pred_mask = pred_mask[0]
+        p_coords = pred_coords[:, valid_pred_mask, :]  # [1, M_pred, 3]
+        p_densities = pred_vals[:, valid_pred_mask]  # [1, M_pred]
+        tokens = gt_res_indices.unsqueeze(0)  # [1, N_cropped]
+        res_coords = gt_coords.unsqueeze(0)  # [1, N_cropped, 3]
         N_res = tokens.shape[1]
-
-        p_coords = res_coords + torch.randn_like(res_coords) * noise_std
-        p_densities = torch.ones((1, N_res))
 
         pred_z, pred_pz = em_model(tokens, p_coords, p_densities, res_coords, shape_watch=True)
         print(f"  Sequence / Contacts Output (pred_z): {list(pred_z.shape)} (Expected: [1, {N_res}, {N_res}])")
-        print(f"  Point-Residue Matching Output (pred_pz): {list(pred_pz.shape)} (Expected: [1, {N_res}, {N_res}])")
+        print(f"  Point-Residue Matching Output (pred_pz): {list(pred_pz.shape)} (Expected: [1, {list(p_coords.shape)[1]}, {N_res}])")

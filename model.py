@@ -27,8 +27,19 @@ NUCLEIC_RESIDUES = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"}
 ALL_RESIDUES = PROTEIN_RESIDUES | NUCLEIC_RESIDUES
 RESIDUE_MAP = {res: idx + 1 for idx, res in enumerate(sorted(list(ALL_RESIDUES)))}
 
-# PDB datasets
-PDB_IDS = ["1ubq", "1pga", "1shg", "1csp", "1a70", "1crn", "2cro", "1acx"]
+PDB_IDS = [
+    '10jx', '10jy', '10ra', '10rc', '10wy', '10xa', '10xc', '10xd', '10xe', '10xf',
+    '10xg', '10xh', '10xl', '10xo', '10xp', '11bg', '11cf', '11cg', '11ch', '12ak',
+    '12hp', '12is', '12td', '12xx', '132l', '133l', '134l', '135l', '13rz', '13sa',
+    '13sb', '13sc', '13sd', '13se', '13sf', '13sg', '13sh', '13si', '13sj', '13sk',
+    '13sl', '13sm', '13sn', '13so', '13sp', '13sq', '13sr', '13ss', '13st', '13su',
+    '13sv', '13sw', '13sx', '13sy', '13sz', '13ta', '13tb', '193l', '194l', '1a1g',
+    '1a1h', '1a1i', '1a1j', '1a1k', '1a1x', '1a2p', '1a2t', '1a2u', '1a3a', '1a3d',
+    '1a3k', '1a4a', '1a4b', '1a4c', '1a4v', '1a5p', '1a62', '1a64', '1a68', '1a6p',
+    '1a70', '1a78', '1a7b', '1a7d', '1a7e', '1a7w', '1a7x', '1a8k', '1a8o', '1a8v',
+    '1a92', '1a94', '1aa2', '1aac', '1aaj', '1aal', '1aan', '1aap', '1aay', '1aaz'
+]
+
 
 GRID_SIZE = 64
 BOX_SIZE = 32.0
@@ -603,6 +614,59 @@ class EMPairformer(nn.Module):
         return s, z, pz, p  # ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
 
 
+class EMContactPredictor(nn.Module):
+    def __init__(self, vocab_size: int, c_s: int = 64, c_z: int = 32, c_pz: int = 32, c_p: int = 32, n_blocks: int = 2, n_heads: int = 4):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_pz = c_pz
+        self.c_p = c_p
+
+        self.embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
+        self.initializer = SeqToPair(c_s, c_z)
+        self.proj_density = nn.Linear(1, c_p)
+
+        self.em_pairformer = EMPairformer(c_s, c_z, c_pz, c_p, n_blocks, n_heads)
+
+        self.contact_head = nn.Sequential(
+            nn.LayerNorm(c_z), nn.Linear(c_z, 16), nn.ReLU(), nn.Linear(16, 1)
+        )
+        self.match_head = nn.Sequential(
+            nn.LayerNorm(c_pz), nn.Linear(c_pz, 16), nn.ReLU(), nn.Linear(16, 1)
+        )
+
+    def rbf_expansion(self, dists: torch.Tensor, num_centers: int) -> torch.Tensor:
+        # dists shape: [B, dim1, dim2]
+        centers = torch.linspace(0.0, BOX_SIZE, num_centers, device=dists.device)
+        widths = BOX_SIZE / num_centers
+        return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)
+
+    def forward(self, tokens: torch.Tensor, p_coords: torch.Tensor, p_densities: torch.Tensor, res_coords: torch.Tensor, shape_watch: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        # tokens: [B, N_res] (long)
+        # p_coords: [B, N_point, 3] (float)
+        # p_densities: [B, N_point] (float)
+        # res_coords: [B, N_res, 3] (float)
+
+        dist_pp = torch.cdist(p_coords, p_coords)  # [B, N_point, N_point]
+        dist_pr = torch.cdist(p_coords, res_coords)  # [B, N_point, N_res]
+
+        p_geom = self.rbf_expansion(dist_pp, num_centers=self.c_p)  # [B, N_point, N_point, c_p]
+        pz_geom = self.rbf_expansion(dist_pr, num_centers=self.c_pz)  # [B, N_point, N_res, c_pz]
+
+        p = p_geom + self.proj_density(p_densities.unsqueeze(-1)).unsqueeze(1)  # [B, N_point, N_point, c_p]
+        pz = pz_geom  # [B, N_point, N_res, c_pz]
+
+        s = self.embedding(tokens)  # [B, N_res, c_s]
+        z = self.initializer(s)  # [B, N_res, N_res, c_z]
+
+        s_out, z_out, pz_out, p_out = self.em_pairformer(s, z, pz, p, shape_watch_first=shape_watch)
+
+        pred_z = self.contact_head(z_out).squeeze(-1)  # [B, N_res, N_res]
+        pred_pz = self.match_head(pz_out).squeeze(-1)  # [B, N_point, N_res]
+
+        return pred_z, pred_pz
+
+
 # ==============================================================================
 # SECTION 5: K-FOLD AND GOOGLE COLAB TRAINING PIPELINE
 # ==============================================================================
@@ -648,21 +712,25 @@ if __name__ == "__main__":
             print(f"Failed to load PDB {pid}: {e}")
 
     # --------------------------------------------------------------------------
-    # DEMO 1: 5-FOLD 3D VOLUMETRIC U-NET CROSS-VALIDATION
+    # DEMO 1: 3D VOLUMETRIC U-NET TRAINING
     # --------------------------------------------------------------------------
     print("\n" + "="*70)
-    print(" PIPELINE 1: TRAINING 5-FOLD VOLUMETRIC U-NET DEMO ")
+    print(" PIPELINE 1: TRAINING VOLUMETRIC U-NET ")
     print("="*70)
 
-    K_FOLDS = 5
-    NUM_EPOCHS = 250
+    NUM_EPOCHS = 500
     steps_per_epoch = 25
     MATCHING_RADIUS = 1.5
     spacing = BOX_SIZE / (GRID_SIZE - 1)
 
-    # Initialize 5 folds on the 8 PDBs using scikit-learn
-    kf = KFold(n_splits=K_FOLDS, shuffle=True, random_state=RANDOM_SEED)
-    pdb_folds = [list(np.array(PDB_IDS)[test_idx]) for _, test_idx in kf.split(PDB_IDS)]
+    # 60/20/20 train/val/test split
+    n_total = len(PDB_IDS)
+    n_train = int(n_total * 0.6)
+    n_val = int(n_total * 0.2)
+    train_pids = PDB_IDS[:n_train]
+    val_pids = PDB_IDS[n_train:n_train + n_val]
+    test_pids = PDB_IDS[n_train + n_val:]
+
     all_folds_pdb_results = []
 
     global_gt_atoms = 0
@@ -671,217 +739,219 @@ if __name__ == "__main__":
     global_resolved_peaks = 0
     global_num_crops = 0
 
-    for fold_idx in range(K_FOLDS):
-        print("\n" + "="*70)
-        print(f" RUNNING FOLD {fold_idx + 1}/{K_FOLDS} (60/20/20 SPLIT) ")
-        print("="*70)
+    print("\n" + "="*70)
+    print(" RUNNING SINGLE TRAIN/VAL/TEST SPLIT (60/20/20) ")
+    print("="*70)
 
-        test_pids = pdb_folds[fold_idx]
-        val_pids = pdb_folds[(fold_idx + 1) % K_FOLDS]
-        train_pids = [pid for i, fold in enumerate(pdb_folds) if i not in (fold_idx, (fold_idx + 1) % K_FOLDS) for pid in fold]
-        print(f"Train structures ({len(train_pids)}): {[p.upper() for p in train_pids]}")
-        print(f"Validation structures ({len(val_pids)}): {[p.upper() for p in val_pids]}")
-        print(f"Test structures ({len(test_pids)}): {[p.upper() for p in test_pids]}")
+    print(f"Train structures ({len(train_pids)}): {[p.upper() for p in train_pids]}")
+    print(f"Validation structures ({len(val_pids)}): {[p.upper() for p in val_pids]}")
+    print(f"Test structures ({len(test_pids)}): {[p.upper() for p in test_pids]}")
 
-        # Construct splits
-        v_train = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in train_pids]
-        v_val = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in val_pids]
-        v_test = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in test_pids]
+    # Construct splits
+    v_train = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in train_pids]
+    v_val = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in val_pids]
+    v_test = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"]) for pid in test_pids]
 
-        # Initialize models
-        unet_atom = torch.compile(UNet(1, 1, init_features=16))
-        # unet_res now takes 2 channels: density + detached atom prediction
-        unet_res = torch.compile(UNet(2, len(RESIDUE_MAP) + 1, init_features=32))
-        opt_unet = torch.optim.Adam(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001, weight_decay=5e-3)
-        scheduler_unet = torch.optim.lr_scheduler.StepLR(opt_unet, step_size=60, gamma=0.5)
-        criterion_atom = BCEDiceLoss()
-        # Add label smoothing to regularize the residue classification
-        criterion_res = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    # Initialize models
+    unet_atom = UNet(1, 1, init_features=16)
+    # unet_res now takes 2 channels: density + detached atom prediction
+    unet_res = UNet(2, len(RESIDUE_MAP) + 1, init_features=32)
+    opt_unet = torch.optim.AdamW(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001, weight_decay=1e-4)
+    scheduler_unet = torch.optim.lr_scheduler.StepLR(opt_unet, step_size=60, gamma=0.5)
+    criterion_atom = BCEDiceLoss()
+    # Add label smoothing to regularize the residue classification
+    criterion_res = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
 
-        def compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res):
-            # pred_atom shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-            # ds_atom shape: [B, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
-            # target_atoms shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-            # pred_res shape: [B, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-            # ds_res shape: [B, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
-            # target_res shape: [B, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
-            loss_atom_main = criterion_atom(pred_atom, target_atoms)
-            loss_res_main = criterion_res(pred_res, target_res)
-            target_atoms_ds = F.max_pool3d(target_atoms, kernel_size=2, stride=2)  # [B, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
-            target_res_ds = F.max_pool3d(target_res.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1).long()  # [B, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2] (long)
-            loss_atom_ds = criterion_atom(ds_atom, target_atoms_ds)
-            loss_res_ds = criterion_res(ds_res, target_res_ds)
-            return loss_atom_main + loss_res_main + 0.5 * (loss_atom_ds + loss_res_ds)
+    def compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res):
+        # pred_atom shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        # ds_atom shape: [B, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+        # target_atoms shape: [B, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        # pred_res shape: [B, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+        # ds_res shape: [B, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+        # target_res shape: [B, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
+        loss_atom_main = criterion_atom(pred_atom, target_atoms)
+        loss_res_main = criterion_res(pred_res, target_res)
+        target_atoms_ds = F.max_pool3d(target_atoms, kernel_size=2, stride=2)  # [B, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+        target_res_ds = target_res[:, ::2, ::2, ::2]  # [B, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2] (long)
+        loss_atom_ds = criterion_atom(ds_atom, target_atoms_ds)
+        loss_res_ds = criterion_res(ds_res, target_res_ds)
+        return loss_atom_main + loss_res_main + 0.5 * (loss_atom_ds + loss_res_ds)
 
-        best_val_loss = float('inf')
-        best_atom_state = None
-        best_res_state = None
+    best_val_loss = float('inf')
+    best_atom_state = None
+    best_res_state = None
+    patience_counter = 0
 
-        # Train loop
-        for epoch in range(1, NUM_EPOCHS + 1):
-            unet_atom.train(); unet_res.train()
-            epoch_loss = torch.tensor(0.0)
-            for _ in range(steps_per_epoch):
-                samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
-                inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                target_res = torch.stack([s[2] for s in samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
+    # Train loop
+    for epoch in range(1, NUM_EPOCHS + 1):
+        unet_atom.train(); unet_res.train()
+        epoch_loss = torch.tensor(0.0)
+        for _ in range(steps_per_epoch):
+            samples = [crop_and_rasterize_dynamic(v_train, is_training=True) for _ in range(4)]
+            inputs = torch.stack([s[0] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            target_atoms = torch.stack([s[1] for s in samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+            target_res = torch.stack([s[2] for s in samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
-                inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)  # shapes same as above
+            inputs, target_atoms, target_res = augment_batch_3d_joint(inputs, target_atoms, target_res)  # shapes same as above
 
-                opt_unet.zero_grad()
-                pred_atom, ds_atom = unet_atom(inputs, return_ds=True)  # pred_atom: [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_atom: [4, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+            opt_unet.zero_grad()
+            pred_atom, ds_atom = unet_atom(inputs, return_ds=True)  # pred_atom: [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_atom: [4, 1, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
 
-                # Cascade: Concatenate raw density and detached atom predictions
-                res_inputs = torch.cat([inputs, torch.sigmoid(pred_atom).detach()], dim=1)
-                pred_res, ds_res = unet_res(res_inputs, return_ds=True)  # pred_res: [4, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_res: [4, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
+            # Cascade: Concatenate raw density and detached atom predictions
+            res_inputs = torch.cat([inputs, torch.sigmoid(pred_atom).detach()], dim=1)
+            pred_res, ds_res = unet_res(res_inputs, return_ds=True)  # pred_res: [4, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE], ds_res: [4, C_res, GRID_SIZE/2, GRID_SIZE/2, GRID_SIZE/2]
 
-                loss = compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res)
-                loss.backward()
-                opt_unet.step()
-                epoch_loss += loss.detach()
-            epoch_loss_val = epoch_loss.item() / steps_per_epoch
-            scheduler_unet.step()
+            loss = compute_unet_loss(pred_atom, ds_atom, target_atoms, pred_res, ds_res, target_res)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(unet_atom.parameters()) + list(unet_res.parameters()), max_norm=1.0)
+            opt_unet.step()
+            epoch_loss += loss.detach()
+        epoch_loss_val = epoch_loss.item() / steps_per_epoch
+        scheduler_unet.step()
 
-            # Periodic evaluation & clean printing
-            if epoch % 50 == 0 or epoch == 1:
-                unet_atom.eval(); unet_res.eval()
-                with torch.no_grad():
-                    val_loss = torch.tensor(0.0)
-                    val_steps = 5
-                    for _ in range(val_steps):
-                        val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
-                        val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                        val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                        val_target_res = torch.stack([s[2] for s in val_samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
-
-                        val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)  # shapes same as above
-                        val_res_inputs = torch.cat([val_inputs, torch.sigmoid(val_pred_atom).detach()], dim=1)
-                        val_pred_res, val_ds_res = unet_res(val_res_inputs, return_ds=True)  # shapes same as above
-                        val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res)
-                    val_loss_val = val_loss.item() / val_steps
-
-                print(f"Fold {fold_idx + 1} | Epoch {epoch:03d}/{NUM_EPOCHS} | Train Loss: {epoch_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
-
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_atom_state = {k: v.clone() for k, v in unet_atom.state_dict().items()}
-                    best_res_state = {k: v.clone() for k, v in unet_res.state_dict().items()}
-
-        # Restore best model for testing
-        if best_atom_state is not None:
-            unet_atom.load_state_dict(best_atom_state)
-            unet_res.load_state_dict(best_res_state)
-
-        # Test Evaluation for this fold
-        print(f"\nEvaluating Fold {fold_idx + 1} on unseen test structures...")
-        unet_atom.eval(); unet_res.eval()
-        peak_finder = PeakFinder()
-
-        fold_pdb_results = []
-        num_test_crops = 10  # 10 random crops per unseen test target
-
-        for pid in test_pids:
-            # Single PDB subset
-            test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
-            pid_gt_atoms = torch.tensor(0, dtype=torch.long)
-            pid_matched_atoms = torch.tensor(0, dtype=torch.long)
-            pid_correct_residues = torch.tensor(0, dtype=torch.long)
-            pid_resolved_peaks = torch.tensor(0, dtype=torch.long)
-
+        # Periodic evaluation & clean printing
+        if epoch % 10 == 0 or epoch == 1:
+            unet_atom.eval(); unet_res.eval()
             with torch.no_grad():
-                for _ in range(num_test_crops):
-                    test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
-                        test_target_structure, is_training=False, return_coords=True
-                    )  # test_input: [GRID_SIZE, GRID_SIZE, GRID_SIZE], gt_coords: [N_cropped, 3], gt_res_indices: [N_cropped] (long)
-                    test_in_batch = test_input.unsqueeze(0).unsqueeze(0)  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                val_loss = torch.tensor(0.0)
+                val_steps = 5
+                for _ in range(val_steps):
+                    val_samples = [crop_and_rasterize_dynamic(v_val, is_training=False) for _ in range(4)]
+                    val_inputs = torch.stack([s[0] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    val_target_atoms = torch.stack([s[1] for s in val_samples]).unsqueeze(1)  # [4, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    val_target_res = torch.stack([s[2] for s in val_samples]).long()  # [4, GRID_SIZE, GRID_SIZE, GRID_SIZE] (long)
 
-                    pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
-                    pred_coords, pred_vals, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_vals: [1, M], pred_mask: [1, M] (bool)
-                    test_res_inputs = torch.cat([test_in_batch, pred_density.detach()], dim=1)
-                    pred_res_logits = unet_res(test_res_inputs)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                    val_pred_atom, val_ds_atom = unet_atom(val_inputs, return_ds=True)  # shapes same as above
+                    val_res_inputs = torch.cat([val_inputs, torch.sigmoid(val_pred_atom).detach()], dim=1)
+                    val_pred_res, val_ds_res = unet_res(val_res_inputs, return_ds=True)  # shapes same as above
+                    val_loss += compute_unet_loss(val_pred_atom, val_ds_atom, val_target_atoms, val_pred_res, val_ds_res, val_target_res)
+                val_loss_val = val_loss.item() / val_steps
 
-                    pred_coords_gpu = pred_coords[0]  # [M, 3]
-                    valid_pred_coords = pred_coords_gpu[pred_mask[0]]  # [M_pred, 3]
+            print(f"Epoch {epoch:03d}/{NUM_EPOCHS} | Train Loss: {epoch_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
 
-                    pid_resolved_peaks += pred_mask[0].sum()
-                    pid_gt_atoms += len(gt_coords)
+            if val_loss_val < best_val_loss:
+                best_val_loss = val_loss_val
+                best_atom_state = {k: v.clone() for k, v in unet_atom.state_dict().items()}
+                best_res_state = {k: v.clone() for k, v in unet_res.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= 5:
+                    print(f"Early stopping triggered at epoch {epoch:03d} (no improvement in best val loss for 5 consecutive evaluations)")
+                    break
 
-                    # Compute dists on GPU
-                    dists = torch.cdist(gt_coords, valid_pred_coords)  # [N_cropped, M_pred]
+    # Restore best model for testing
+    if best_atom_state is not None:
+        unet_atom.load_state_dict(best_atom_state)
+        unet_res.load_state_dict(best_res_state)
 
-                    # Convert to CPU for Hungarian algorithm (scipy) to avoid GPU-CPU sync inside the loop
-                    dists_cpu = dists.cpu().numpy()
-                    r_indices, c_indices = linear_sum_assignment(dists_cpu)
-                    r_indices = torch.from_numpy(r_indices).to(dists.device)
-                    c_indices = torch.from_numpy(c_indices).to(dists.device)
+    # Test Evaluation
+    print(f"\nEvaluating on unseen test structures...")
+    unet_atom.eval(); unet_res.eval()
+    peak_finder = PeakFinder()
 
-                    # Filter matches that are within the MATCHING_RADIUS
-                    matched_dists = dists[r_indices, c_indices]
-                    valid_mask = matched_dists <= MATCHING_RADIUS
-                    valid_r = r_indices[valid_mask]
-                    valid_c = c_indices[valid_mask]
+    num_test_crops = 10  # 10 random crops per unseen test target
 
-                    num_valid = len(valid_r)
-                    if num_valid > 0:
-                        pid_matched_atoms += num_valid
-                        p_coords = valid_pred_coords[valid_c]  # [num_valid, 3]
-                        grid_idx = torch.clamp(torch.round(p_coords / spacing).long(), 0, GRID_SIZE - 1)  # [num_valid, 3]
+    for pid in test_pids:
+        # Single PDB subset
+        test_target_structure = [(all_structures[pid]["v_coords"], all_structures[pid]["v_res_idx"])]
+        pid_gt_atoms = torch.tensor(0, dtype=torch.long)
+        pid_matched_atoms = torch.tensor(0, dtype=torch.long)
+        pid_correct_residues = torch.tensor(0, dtype=torch.long)
+        pid_resolved_peaks = torch.tensor(0, dtype=torch.long)
 
-                        logits = pred_res_logits[0, :, grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]  # [C_res, num_valid]
-                        pred_res = torch.argmax(logits[1:], dim=0) + 1  # [num_valid]
-                        gt_res = gt_res_indices[valid_r]  # [num_valid]
+        with torch.no_grad():
+            for _ in range(num_test_crops):
+                test_input, _, _, gt_coords, gt_res_indices = crop_and_rasterize_dynamic(
+                    test_target_structure, is_training=False, return_coords=True
+                )  # test_input: [GRID_SIZE, GRID_SIZE, GRID_SIZE], gt_coords: [N_cropped, 3], gt_res_indices: [N_cropped] (long)
+                test_in_batch = test_input.unsqueeze(0).unsqueeze(0)  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-                        pid_correct_residues += (pred_res == gt_res).sum()
+                pred_density = F.relu(unet_atom(test_in_batch))  # [1, 1, GRID_SIZE, GRID_SIZE, GRID_SIZE]
+                pred_coords, pred_vals, pred_mask = peak_finder(pred_density)  # pred_coords: [1, M, 3], pred_vals: [1, M], pred_mask: [1, M] (bool)
+                test_res_inputs = torch.cat([test_in_batch, pred_density.detach()], dim=1)
+                pred_res_logits = unet_res(test_res_inputs)  # [1, C_res, GRID_SIZE, GRID_SIZE, GRID_SIZE]
 
-            avg_peaks_per_crop = (pid_resolved_peaks.float() / num_test_crops).item()
-            recovery_pct = (pid_matched_atoms.float() / pid_gt_atoms * 100 if pid_gt_atoms > 0 else torch.tensor(0.0)).item()
-            precision_pct = (pid_matched_atoms.float() / pid_resolved_peaks * 100 if pid_resolved_peaks > 0 else torch.tensor(0.0)).item()
-            f1_pct = 2 * (precision_pct * recovery_pct) / (precision_pct + recovery_pct) if (precision_pct + recovery_pct) > 0 else 0.0
-            class_pct = (pid_correct_residues.float() / pid_matched_atoms * 100 if pid_matched_atoms > 0 else torch.tensor(0.0)).item()
+                pred_coords_gpu = pred_coords[0]  # [M, 3]
+                valid_pred_coords = pred_coords_gpu[pred_mask[0]]  # [M_pred, 3]
 
-            print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Precision: {precision_pct:.1f}% | F1: {f1_pct:.1f}% | Classification: {class_pct:.1f}%")
-            tp = pid_matched_atoms.item()
-            fp = (pid_resolved_peaks - pid_matched_atoms).item()
-            fn = (pid_gt_atoms - pid_matched_atoms).item()
-            correct = pid_correct_residues.item()
-            total_peaks = pid_resolved_peaks.item()
-            gt_atoms = pid_gt_atoms.item()
+                pid_resolved_peaks += pred_mask[0].sum()
+                pid_gt_atoms += len(gt_coords)
 
-            print(f"    Confusion Matrix (2x2):")
-            print(f"                 Actual Atom   Actual Space")
-            print(f"      Pred Peak    TP: {tp:<5}     FP: {fp:<5}")
-            print(f"      No Peak      FN: {fn:<5}     TN: N/A")
+                # Compute dists on GPU
+                dists = torch.cdist(gt_coords, valid_pred_coords)  # [N_cropped, M_pred]
 
-            result_entry = {
-                "fold": fold_idx + 1, "pid": pid.upper(), "avg_peaks": avg_peaks_per_crop,
-                "gt_atoms": gt_atoms, "matched_atoms": tp,
-                "recovery_pct": recovery_pct, "precision_pct": precision_pct, "f1_pct": f1_pct, "class_pct": class_pct
-            }
-            fold_pdb_results.append(result_entry)
-            all_folds_pdb_results.append(result_entry)
+                # Convert to CPU for Hungarian algorithm (scipy) to avoid GPU-CPU sync inside the loop
+                dists_cpu = dists.cpu().numpy()
+                r_indices, c_indices = linear_sum_assignment(dists_cpu)
+                r_indices = torch.from_numpy(r_indices).to(dists.device)
+                c_indices = torch.from_numpy(c_indices).to(dists.device)
 
-            global_gt_atoms += gt_atoms
-            global_matched_atoms += tp
-            global_correct_residues += correct
-            global_resolved_peaks += total_peaks
-            global_num_crops += num_test_crops
+                # Filter matches that are within the MATCHING_RADIUS
+                matched_dists = dists[r_indices, c_indices]
+                valid_mask = matched_dists <= MATCHING_RADIUS
+                valid_r = r_indices[valid_mask]
+                valid_c = c_indices[valid_mask]
 
-        # Free VRAM memory to prevent leaks on Colab
-        del unet_atom, unet_res, opt_unet
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                num_valid = len(valid_r)
+                if num_valid > 0:
+                    pid_matched_atoms += num_valid
+                    p_coords = valid_pred_coords[valid_c]  # [num_valid, 3]
+                    grid_idx = torch.clamp(torch.round(p_coords / spacing).long(), 0, GRID_SIZE - 1)  # [num_valid, 3]
+
+                    logits = pred_res_logits[0, :, grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]  # [C_res, num_valid]
+                    pred_res = torch.argmax(logits[1:], dim=0) + 1  # [num_valid]
+                    gt_res = gt_res_indices[valid_r]  # [num_valid]
+
+                    pid_correct_residues += (pred_res == gt_res).sum()
+
+        avg_peaks_per_crop = (pid_resolved_peaks.float() / num_test_crops).item()
+        recovery_pct = (pid_matched_atoms.float() / pid_gt_atoms * 100 if pid_gt_atoms > 0 else torch.tensor(0.0)).item()
+        precision_pct = (pid_matched_atoms.float() / pid_resolved_peaks * 100 if pid_resolved_peaks > 0 else torch.tensor(0.0)).item()
+        f1_pct = 2 * (precision_pct * recovery_pct) / (precision_pct + recovery_pct) if (precision_pct + recovery_pct) > 0 else 0.0
+        class_pct = (pid_correct_residues.float() / pid_matched_atoms * 100 if pid_matched_atoms > 0 else torch.tensor(0.0)).item()
+
+        print(f"  Target {pid.upper()} | Peaks/Crop: {avg_peaks_per_crop:.1f} | Recovery: {recovery_pct:.1f}% | Precision: {precision_pct:.1f}% | F1: {f1_pct:.1f}% | Classification: {class_pct:.1f}%")
+        tp = pid_matched_atoms.item()
+        fp = (pid_resolved_peaks - pid_matched_atoms).item()
+        fn = (pid_gt_atoms - pid_matched_atoms).item()
+        correct = pid_correct_residues.item()
+        total_peaks = pid_resolved_peaks.item()
+        gt_atoms = pid_gt_atoms.item()
+
+        print(f"    Confusion Matrix (2x2):")
+        print(f"                 Actual Atom   Actual Space")
+        print(f"      Pred Peak    TP: {tp:<5}     FP: {fp:<5}")
+        print(f"      No Peak      FN: {fn:<5}     TN: N/A")
+
+        result_entry = {
+            "pid": pid.upper(), "avg_peaks": avg_peaks_per_crop,
+            "gt_atoms": gt_atoms, "matched_atoms": tp,
+            "recovery_pct": recovery_pct, "precision_pct": precision_pct, "f1_pct": f1_pct, "class_pct": class_pct
+        }
+        all_folds_pdb_results.append(result_entry)
+
+        global_gt_atoms += gt_atoms
+        global_matched_atoms += tp
+        global_correct_residues += correct
+        global_resolved_peaks += total_peaks
+        global_num_crops += num_test_crops
+
+    # Free VRAM memory to prevent leaks on Colab
+    del unet_atom, unet_res, opt_unet
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # --------------------------------------------------------------------------
-    # FINAL CONSOLIDATED CROSS-VALIDATION REPORT
+    # FINAL CONSOLIDATED REPORT
     # --------------------------------------------------------------------------
     print("\n" + "="*105)
-    print(" FINAL 5-FOLD CROSS-VALIDATION SUMMARY TABLE ")
+    print(" FINAL EVALUATION SUMMARY TABLE ")
     print("="*105)
-    print(" Fold | PDB ID  | Resolved/Crop | Total Atoms | Recovery % | Precision % | F1 % | Classification %")
+    print(" PDB ID  | Resolved/Crop | Total Atoms | Recovery % | Precision % | F1 % | Classification %")
     print("-" * 105)
     for res in all_folds_pdb_results:
-        print(f"  {res['fold']:<3} | {res['pid']:<7} | {res['avg_peaks']:<13.1f} | {res['gt_atoms']:<11} | {res['recovery_pct']:<10.1f}% | {res['precision_pct']:<11.1f}% | {res['f1_pct']:<4.1f}% | {res['class_pct']:<16.1f}%")
+        print(f"  {res['pid']:<7} | {res['avg_peaks']:<13.1f} | {res['gt_atoms']:<11} | {res['recovery_pct']:<10.1f}% | {res['precision_pct']:<11.1f}% | {res['f1_pct']:<4.1f}% | {res['class_pct']:<16.1f}%")
     print("-" * 105)
 
     global_avg_peaks = global_resolved_peaks / global_num_crops if global_num_crops > 0 else 0.0
@@ -890,7 +960,7 @@ if __name__ == "__main__":
     global_f1 = 2 * (global_precision * global_recovery) / (global_precision + global_recovery) if (global_precision + global_recovery) > 0 else 0.0
     global_classification = (global_correct_residues / global_matched_atoms) * 100 if global_matched_atoms > 0 else 0.0
 
-    print(f" {'OVERALL':<7} | {'ALL':<7} | {global_avg_peaks:<13.1f} | {global_gt_atoms:<11} | {global_recovery:<10.1f}% | {global_precision:<11.1f}% | {global_f1:<4.1f}% | {global_classification:<16.1f}%")
+    print(f" {'OVERALL':<7} | {global_avg_peaks:<13.1f} | {global_gt_atoms:<11} | {global_recovery:<10.1f}% | {global_precision:<11.1f}% | {global_f1:<4.1f}% | {global_classification:<16.1f}%")
     print("="*105 + "\n")
 
     # --------------------------------------------------------------------------
@@ -900,9 +970,9 @@ if __name__ == "__main__":
     print(" PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION ")
     print("="*70)
 
-    pairformer = torch.compile(ContactPredictor(
+    pairformer = ContactPredictor(
         vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, n_blocks=1, n_heads=2, dropout=0.4
-    ))
+    )
     opt_pf = torch.optim.Adam(pairformer.parameters(), lr=0.0003, weight_decay=5e-3)
     sched_pf = torch.optim.lr_scheduler.CosineAnnealingLR(opt_pf, T_max=200, eta_min=1e-6)
     criterion_pf = nn.BCEWithLogitsLoss()
@@ -967,68 +1037,108 @@ if __name__ == "__main__":
         vis_pred = torch.sigmoid(pairformer(vis_tokens, shape_watch=True)).squeeze(0).cpu()  # [seq_len, seq_len]
         vis_gt = (torch.cdist(vis_s["s_coords"].unsqueeze(0), vis_s["s_coords"].unsqueeze(0)).squeeze(0) < CONTACT_THRESHOLD).float()  # [seq_len, seq_len]
     print("\n" + "="*70)
-    print(" PIPELINE 3: MATHEMATICAL DYNAMIC SHAPE WATCHING OF EM-PAIRFORMER ")
+    print(" PIPELINE 3: TRAINING EM-PAIRFORMER OPTIMIZATION ")
     print("="*70)
 
-    # Shape watcher unit tests for the EM-Pairformer (The Karpathy Touch!)
-    def run_em_pairformer_shape_watcher_demo():
-        print("\n[Shape Watcher] Initializing EM-Pairformer Demo...")
-        B, N_res, N_point = 1, 20, 15
-        c_s, c_z, c_pz, c_p = 64, 32, 32, 32
+    em_model = EMContactPredictor(
+        vocab_size=len(RESIDUE_MAP), c_s=32, c_z=16, c_pz=16, c_p=16, n_blocks=1, n_heads=2
+    )
+    opt_em = torch.optim.Adam(em_model.parameters(), lr=0.0003, weight_decay=5e-3)
+    sched_em = torch.optim.lr_scheduler.CosineAnnealingLR(opt_em, T_max=100, eta_min=1e-6)
+    criterion_em = nn.BCEWithLogitsLoss()
 
-        # 1. Mock inputs matching physical coordinates and densities
-        vocab_size = len(RESIDUE_MAP)
-        mock_tokens = torch.randint(1, vocab_size, (B, N_res))  # [B, N_res] (long)
-        mock_p_coords = torch.rand(B, N_point, 3) * BOX_SIZE  # [B, N_point, 3]
-        mock_p_densities = torch.rand(B, N_point)  # [B, N_point]
-        mock_res_coords = torch.rand(B, N_res, 3) * BOX_SIZE  # [B, N_res, 3]
+    # Split structures into train/val
+    struct_keys = list(all_structures.keys())
+    em_train_pids = struct_keys[:-2]
+    em_val_pids = struct_keys[-2:]
 
-        # 2. Build physical representation matrices using RBF
-        def mock_rbf_expansion(dists: torch.Tensor, num_centers: int = 32) -> torch.Tensor:
-            # dists: [B, N_dim1, N_dim2]
-            centers = torch.linspace(0.0, BOX_SIZE, num_centers)  # [num_centers]
-            widths = BOX_SIZE / num_centers
-            return torch.exp(-((dists.unsqueeze(-1) - centers) / widths) ** 2)  # [B, N_dim1, N_dim2, num_centers]
+    num_em_epochs = 100
+    best_em_val_loss = float('inf')
+    best_em_state = None
 
-        print("  Generating geometric representation matrices...")
-        dist_pp = torch.cdist(mock_p_coords, mock_p_coords)  # [B, N_point, N_point]
-        dist_pr = torch.cdist(mock_p_coords, mock_res_coords)  # [B, N_point, N_res]
+    noise_std = 1.0  # 1.0 Å noise to simulate peak uncertainty
 
-        p_geom = mock_rbf_expansion(dist_pp, num_centers=c_p)  # [B, N_point, N_point, c_p]
-        pz_geom = mock_rbf_expansion(dist_pr, num_centers=c_pz)  # [B, N_point, N_res, c_pz]
+    for epoch in range(1, num_em_epochs + 1):
+        em_model.train()
+        train_loss = torch.tensor(0.0)
 
-        # Inject density features into point representations
-        proj_density = nn.Linear(1, c_p)  # maps [B, N_point, 1] -> [B, N_point, c_p]
-        p = p_geom + proj_density(mock_p_densities.unsqueeze(-1)).unsqueeze(1)  # [B, N_point, N_point, c_p]
-        pz = pz_geom  # [B, N_point, N_res, c_pz]
+        for pid in em_train_pids:
+            s = all_structures[pid]
+            tokens = s["s_seq"].unsqueeze(0)  # [1, N_res]
+            res_coords = s["s_coords"].unsqueeze(0)  # [1, N_res, 3]
+            N_res = tokens.shape[1]
 
-        # Embed sequence and initialize residue pairs
-        embedding = nn.Embedding(vocab_size + 1, c_s, padding_idx=0)
-        initializer = SeqToPair(c_s, c_z)
+            # Ground truth residue contacts
+            target_z = (torch.cdist(res_coords, res_coords) < CONTACT_THRESHOLD).float()
 
-        s = embedding(mock_tokens)  # [B, N_res, c_s]
-        z = initializer(s)  # [B, N_res, N_res, c_z]
+            # Generate noisy and permuted points
+            perm = torch.randperm(N_res)
+            p_coords = (res_coords + torch.randn_like(res_coords) * noise_std)[:, perm, :]
+            p_densities = torch.ones((1, N_res)) + torch.randn((1, N_res)) * 0.1
 
-        # 3. Instantiate EMPairformerStack
-        print("  Instantiating EMPairformerStack...")
-        em_pairformer = torch.compile(EMPairformer(c_s=c_s, c_z=c_z, c_pz=c_pz, c_p=c_p, n_blocks=2, n_heads=4))
-        em_pairformer.eval()
+            # Ground truth point-residue matching
+            target_pz = torch.zeros((1, N_res, N_res))
+            for i, p_idx in enumerate(perm):
+                target_pz[0, i, p_idx] = 1.0
 
-        # 4. Forward pass under dynamic Shape Watcher
-        print("  Running EM-Pairformer forward pass:")
+            opt_em.zero_grad()
+            pred_z, pred_pz = em_model(tokens, p_coords, p_densities, res_coords)
+            loss = criterion_em(pred_z, target_z) + criterion_em(pred_pz, target_pz)
+            loss.backward()
+            opt_em.step()
+            train_loss += loss.detach()
+
+        train_loss_val = train_loss.item() / len(em_train_pids)
+        sched_em.step()
+
+        # Validation
+        em_model.eval()
         with torch.no_grad():
-            s_out, z_out, pz_out, p_out = em_pairformer(s, z, pz, p, shape_watch_first=True)  # shapes: ([B, N_res, c_s], [B, N_res, N_res, c_z], [B, N_point, N_res, c_pz], [B, N_point, N_point, c_p])
+            val_loss_tensor = torch.tensor(0.0)
+            for pid in em_val_pids:
+                s = all_structures[pid]
+                tokens = s["s_seq"].unsqueeze(0)
+                res_coords = s["s_coords"].unsqueeze(0)
+                N_res = tokens.shape[1]
 
-        print("\n  [EM-Pairformer Output Shapes Verification]")
-        print(f"    Sequence Feature (s): {list(s_out.shape)} (Expected: [1, 20, 64])")
-        print(f"    Residue-Residue (z):  {list(z_out.shape)} (Expected: [1, 20, 20, 32])")
-        print(f"    Point-Residue (pz):   {list(pz_out.shape)} (Expected: [1, 15, 20, 32])")
-        print(f"    Point-Point (p):      {list(p_out.shape)} (Expected: [1, 15, 15, 32])")
+                target_z = (torch.cdist(res_coords, res_coords) < CONTACT_THRESHOLD).float()
+                perm = torch.arange(N_res)  # keep sequential for validation stability
+                p_coords = (res_coords + torch.randn_like(res_coords) * noise_std)[:, perm, :]
+                p_densities = torch.ones((1, N_res))
 
-        assert s_out.shape == (B, N_res, c_s)
-        assert z_out.shape == (B, N_res, N_res, c_z)
-        assert pz_out.shape == (B, N_point, N_res, c_pz)
-        assert p_out.shape == (B, N_point, N_point, c_p)
-        print("  Mathematics and dimensions verified successfully!")
+                target_pz = torch.zeros((1, N_res, N_res))
+                for i, p_idx in enumerate(perm):
+                    target_pz[0, i, p_idx] = 1.0
 
-    run_em_pairformer_shape_watcher_demo()
+                pred_z, pred_pz = em_model(tokens, p_coords, p_densities, res_coords)
+                val_loss_tensor += criterion_em(pred_z, target_z) + criterion_em(pred_pz, target_pz)
+
+            val_loss_val = val_loss_tensor.item() / len(em_val_pids)
+
+        if val_loss_val < best_em_val_loss:
+            best_em_val_loss = val_loss_val
+            best_em_state = {k: v.clone() for k, v in em_model.state_dict().items()}
+
+        if epoch % 10 == 0 or epoch == 1 or epoch == num_em_epochs:
+            current_lr = opt_em.param_groups[0]['lr']
+            print(f"EM-Pairformer Epoch {epoch:03d}/{num_em_epochs} | LR: {current_lr:.6f} | Train Loss: {train_loss_val:.4f} | Val Loss: {val_loss_val:.4f}")
+
+    if best_em_state is not None:
+        em_model.load_state_dict(best_em_state)
+        print(f"Loaded best EM-Pairformer checkpoint with Val Loss: {best_em_val_loss:.4f}")
+
+    # Final Shape Watcher Verification Pass
+    print("\nRunning shape-watching verification pass with trained EM-Pairformer:")
+    em_model.eval()
+    with torch.no_grad():
+        s = all_structures[em_val_pids[0]]
+        tokens = s["s_seq"].unsqueeze(0)
+        res_coords = s["s_coords"].unsqueeze(0)
+        N_res = tokens.shape[1]
+
+        p_coords = res_coords + torch.randn_like(res_coords) * noise_std
+        p_densities = torch.ones((1, N_res))
+
+        pred_z, pred_pz = em_model(tokens, p_coords, p_densities, res_coords, shape_watch=True)
+        print(f"  Sequence / Contacts Output (pred_z): {list(pred_z.shape)} (Expected: [1, {N_res}, {N_res}])")
+        print(f"  Point-Residue Matching Output (pred_pz): {list(pred_pz.shape)} (Expected: [1, {N_res}, {N_res}])")

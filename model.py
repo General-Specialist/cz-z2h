@@ -770,6 +770,8 @@ if __name__ == "__main__":
     unet_atom = UNet(1, 1, init_features=16)
     # unet_res now takes 2 channels: density + detached atom prediction
     unet_res = UNet(2, len(RESIDUE_MAP) + 1, init_features=32)
+
+
     opt_unet = torch.optim.AdamW(list(unet_atom.parameters()) + list(unet_res.parameters()), lr=0.001, weight_decay=0.01)
     scheduler_unet = torch.optim.lr_scheduler.CosineAnnealingLR(opt_unet, T_max=NUM_EPOCHS, eta_min=1e-6)
     criterion_atom = BCEDiceLoss()
@@ -952,7 +954,7 @@ if __name__ == "__main__":
         global_num_crops += num_test_crops
 
     # Free VRAM memory to prevent leaks on Colab
-    del unet_atom, unet_res, opt_unet
+    del opt_unet
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

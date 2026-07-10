@@ -1,0 +1,10 @@
+dot product of a and b = |a| |b| cos(theta)
+perpendicular if dot product is 0
+cross product of a and b = |a| |b| sin(theta)
+parallel if cross product is 0
+unit vectors have magnitude 1
+area of a parallelogram: magnitude of cross product
+area of a triangle: magnitude of cross product
+vector valued function: a function with in real input(s) and a vector output
+function of several variables: a function with a point as input and a number as output
+arc length: integrate magnitude of the derivative

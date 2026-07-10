@@ -1,0 +1,219 @@
+===========================================================================
+ PREPARING MOLECULAR DATABASE
+===========================================================================
+
+Caching mmCIF files: 100%|██████████| 8/8 [00:00<00:00, 231.69it/s]
+
+
+======================================================================
+ PIPELINE 1: TRAINING 5-FOLD VOLUMETRIC U-NET DEMO
+======================================================================
+
+======================================================================
+ RUNNING FOLD 1/5 (60/20/20 SPLIT)
+======================================================================
+Train structures (4): ['1SHG', '1A70', '1CSP', '2CRO']
+Validation structures (2): ['1UBQ', '1ACX']
+Test structures (2): ['1PGA', '1CRN']
+
+
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/fx_passes/joint_graph.py:295: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  self.node_replacements[node] = tensor.flatten()[0].item()
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
+
+Fold 1 | Epoch 001/100 | Train Loss: 6.2092 | Val Loss: 5.2033
+Fold 1 | Epoch 050/100 | Train Loss: 4.5563 | Val Loss: 4.6755
+Fold 1 | Epoch 100/100 | Train Loss: 4.2072 | Val Loss: 4.4657
+Fold 1 | Epoch 150/100 | Train Loss: 3.8607 | Val Loss: 4.1353
+Fold 1 | Epoch 200/100 | Train Loss: 3.5371 | Val Loss: 4.2361
+Fold 1 | Epoch 250/100 | Train Loss: 3.3474 | Val Loss: 3.8214
+
+Evaluating Fold 1 on unseen test structures...
+
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
+
+  Target 1PGA | Peaks/Crop: 210.3 | Recovery: 55.1% | Precision: 91.7% | F1: 68.9% | Classification: 19.7%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 1928      FP: 175
+      No Peak      FN: 1568      TN: N/A
+  Target 1CRN | Peaks/Crop: 184.3 | Recovery: 55.6% | Precision: 90.7% | F1: 68.9% | Classification: 10.1%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 1671      FP: 172
+      No Peak      FN: 1337      TN: N/A
+
+======================================================================
+ RUNNING FOLD 2/5 (60/20/20 SPLIT)
+======================================================================
+Train structures (4): ['1PGA', '1CRN', '1CSP', '2CRO']
+Validation structures (2): ['1SHG', '1A70']
+Test structures (2): ['1UBQ', '1ACX']
+Fold 2 | Epoch 001/100 | Train Loss: 6.3208 | Val Loss: 5.3368
+Fold 2 | Epoch 050/100 | Train Loss: 4.5964 | Val Loss: 4.7082
+Fold 2 | Epoch 100/100 | Train Loss: 4.3532 | Val Loss: 4.6650
+Fold 2 | Epoch 150/100 | Train Loss: 4.1054 | Val Loss: 4.7051
+Fold 2 | Epoch 200/100 | Train Loss: 3.8899 | Val Loss: 4.5827
+Fold 2 | Epoch 250/100 | Train Loss: 3.6922 | Val Loss: 4.4743
+
+Evaluating Fold 2 on unseen test structures...
+  Target 1UBQ | Peaks/Crop: 260.3 | Recovery: 53.4% | Precision: 89.3% | F1: 66.8% | Classification: 18.7%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 2324      FP: 279
+      No Peak      FN: 2031      TN: N/A
+  Target 1ACX | Peaks/Crop: 252.1 | Recovery: 50.3% | Precision: 93.0% | F1: 65.3% | Classification: 12.1%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 2345      FP: 176
+      No Peak      FN: 2318      TN: N/A
+
+======================================================================
+ RUNNING FOLD 3/5 (60/20/20 SPLIT)
+======================================================================
+Train structures (5): ['1PGA', '1CRN', '1UBQ', '1ACX', '2CRO']
+Validation structures (1): ['1CSP']
+Test structures (2): ['1SHG', '1A70']
+Fold 3 | Epoch 001/100 | Train Loss: 6.0600 | Val Loss: 5.3202
+Fold 3 | Epoch 050/100 | Train Loss: 4.6423 | Val Loss: 4.9778
+Fold 3 | Epoch 100/100 | Train Loss: 4.4941 | Val Loss: 4.7066
+Fold 3 | Epoch 150/100 | Train Loss: 4.4452 | Val Loss: 4.6305
+Fold 3 | Epoch 200/100 | Train Loss: 4.2432 | Val Loss: 4.5263
+Fold 3 | Epoch 250/100 | Train Loss: 4.0780 | Val Loss: 4.3426
+
+Evaluating Fold 3 on unseen test structures...
+  Target 1SHG | Peaks/Crop: 224.3 | Recovery: 53.1% | Precision: 92.1% | F1: 67.3% | Classification: 11.1%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 2065      FP: 178
+      No Peak      FN: 1827      TN: N/A
+  Target 1A70 | Peaks/Crop: 294.0 | Recovery: 51.2% | Precision: 91.3% | F1: 65.6% | Classification: 17.6%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 2684      FP: 256
+      No Peak      FN: 2562      TN: N/A
+
+======================================================================
+ RUNNING FOLD 4/5 (60/20/20 SPLIT)
+======================================================================
+Train structures (6): ['1PGA', '1CRN', '1UBQ', '1ACX', '1SHG', '1A70']
+Validation structures (1): ['2CRO']
+Test structures (1): ['1CSP']
+Fold 4 | Epoch 001/100 | Train Loss: 5.9273 | Val Loss: 5.3538
+Fold 4 | Epoch 050/100 | Train Loss: 4.6274 | Val Loss: 4.8048
+Fold 4 | Epoch 100/100 | Train Loss: 4.5521 | Val Loss: 4.7367
+Fold 4 | Epoch 150/100 | Train Loss: 4.3902 | Val Loss: 4.5407
+Fold 4 | Epoch 200/100 | Train Loss: 4.2330 | Val Loss: 4.4397
+Fold 4 | Epoch 250/100 | Train Loss: 4.0744 | Val Loss: 4.3698
+
+Evaluating Fold 4 on unseen test structures...
+  Target 1CSP | Peaks/Crop: 254.3 | Recovery: 55.4% | Precision: 88.9% | F1: 68.2% | Classification: 9.5%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 2260      FP: 283
+      No Peak      FN: 1821      TN: N/A
+
+======================================================================
+ RUNNING FOLD 5/5 (60/20/20 SPLIT)
+======================================================================
+Train structures (5): ['1UBQ', '1ACX', '1SHG', '1A70', '1CSP']
+Validation structures (2): ['1PGA', '1CRN']
+Test structures (1): ['2CRO']
+Fold 5 | Epoch 001/100 | Train Loss: 5.7897 | Val Loss: 5.3533
+Fold 5 | Epoch 050/100 | Train Loss: 4.6352 | Val Loss: 4.9393
+Fold 5 | Epoch 100/100 | Train Loss: 4.4684 | Val Loss: 4.7537
+Fold 5 | Epoch 150/100 | Train Loss: 4.2333 | Val Loss: 4.3856
+Fold 5 | Epoch 200/100 | Train Loss: 4.0683 | Val Loss: 4.0746
+Fold 5 | Epoch 250/100 | Train Loss: 3.8835 | Val Loss: 4.1893
+
+Evaluating Fold 5 on unseen test structures...
+  Target 2CRO | Peaks/Crop: 235.5 | Recovery: 53.6% | Precision: 94.7% | F1: 68.5% | Classification: 9.6%
+    Confusion Matrix (2x2):
+                 Actual Atom   Actual Space
+      Pred Peak    TP: 2231      FP: 124
+      No Peak      FN: 1928      TN: N/A
+
+=========================================================================================================
+ FINAL 5-FOLD CROSS-VALIDATION SUMMARY TABLE
+=========================================================================================================
+ Fold | PDB ID  | Resolved/Crop | Total Atoms | Recovery % | Precision % | F1 % | Classification %
+---------------------------------------------------------------------------------------------------------
+  1   | 1PGA    | 210.3         | 3496        | 55.1      % | 91.7       % | 68.9% | 19.7            %
+  1   | 1CRN    | 184.3         | 3008        | 55.6      % | 90.7       % | 68.9% | 10.1            %
+  2   | 1UBQ    | 260.3         | 4355        | 53.4      % | 89.3       % | 66.8% | 18.7            %
+  2   | 1ACX    | 252.1         | 4663        | 50.3      % | 93.0       % | 65.3% | 12.1            %
+  3   | 1SHG    | 224.3         | 3892        | 53.1      % | 92.1       % | 67.3% | 11.1            %
+  3   | 1A70    | 294.0         | 5246        | 51.2      % | 91.3       % | 65.6% | 17.6            %
+  4   | 1CSP    | 254.3         | 4081        | 55.4      % | 88.9       % | 68.2% | 9.5             %
+  5   | 2CRO    | 235.5         | 4159        | 53.6      % | 94.7       % | 68.5% | 9.6             %
+---------------------------------------------------------------------------------------------------------
+ OVERALL | ALL     | 239.4         | 32900       | 53.2      % | 91.4       % | 67.3% | 13.7            %
+=========================================================================================================
+
+
+======================================================================
+ PIPELINE 2: TRAINING PAIRFORMER CONTACT MAP OPTIMIZATION
+======================================================================
+
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/fx_passes/joint_graph.py:295: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  self.node_replacements[node] = tensor.flatten()[0].item()
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/fx_passes/joint_graph.py:295: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  self.node_replacements[node] = tensor.flatten()[0].item()
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
+
+Pairformer Epoch 001/200 | Train Loss: 0.5613 | Val Loss: 0.4026
+Pairformer Epoch 050/200 | Train Loss: 0.1202 | Val Loss: 0.2310
+Pairformer Epoch 100/200 | Train Loss: 0.0008 | Val Loss: 0.5682
+Pairformer Epoch 150/200 | Train Loss: 0.0003 | Val Loss: 0.5522
+Pairformer Epoch 200/200 | Train Loss: 0.0001 | Val Loss: 0.6417
+
+=== STARTING PAIRFORMER BLOCK SHAPE-WATCHING ===
+
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+
+    [Shape Watcher - BiasedAttention]
+      x=[1, 1, 76, 64], bias=[1, 76, 76, 32], out=[1, 76, 64]
+    [Shape Watcher - OuterProduct]
+      outer_flat=[1, 76, 76, 256], update=[1, 76, 76, 32]
+    [Shape Watcher - TriangleMultiplicativeUpdate]
+      gathered_sum=[1, 76, 76, 32]
+=== END PAIRFORMER BLOCK SHAPE-WATCHING ===
+
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py:116: UserWarning: called a synchronizing CUDA operation (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:162.)
+  return func(*args, **kwargs)
